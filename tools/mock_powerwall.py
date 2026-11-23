@@ -75,6 +75,114 @@ def simulated_state(capacity_wh=13500.0):
     }
 
 
+def _sig(name, value=None, text_value=None, bool_value=None):
+    return {
+        "name": name,
+        "value": value,
+        "textValue": text_value,
+        "boolValue": bool_value,
+        "timestamp": "2026-11-22T20:00:00Z",
+    }
+
+
+def simulated_components(st):
+    t = time.time() - START_TIME
+    dc_total = st["solar_w"] / 0.96 if st["solar_w"] > 0 else 0.0
+    # 4 active roof planes (A-D) + 2 unused standby inputs (E-F)
+    weights = (0.34, 0.28, 0.23, 0.15, 0.0, 0.0)
+    voltages = (318.0, 312.0, 298.0, 285.0, 0.0, 0.0)
+    pch_signals = []
+    for idx, ch in enumerate(("A", "B", "C", "D", "E", "F")):
+        w = dc_total * weights[idx]
+        if weights[idx] > 0:
+            v = round(voltages[idx] + 4.0 * math.sin(t / 40.0 + idx), 1)
+            i = round(w / v, 2) if v > 0 else 0.0
+            state = "Pv_Active" if w > 5.0 else "Pv_Standby"
+        else:
+            v = 0.0
+            i = -3.6e-16  # realistic PW3 night/unused floating-point noise
+            state = "Pv_Standby"
+        pch_signals.append(_sig(f"PCH_PvState_{ch}", 1 if state == "Pv_Active" else 0, state))
+        pch_signals.append(_sig(f"PCH_PvVoltage{ch}", v))
+        pch_signals.append(_sig(f"PCH_PvCurrent{ch}", i))
+
+    v_an = round(120.6 + 0.4 * math.sin(t / 25.0), 1)
+    v_bn = round(120.8 + 0.4 * math.cos(t / 25.0), 1)
+    v_ab = round(v_an + v_bn, 1)
+    freq = round(60.00 + 0.02 * math.sin(t / 15.0), 2)
+    fan_a = round(1280 + 180 * math.sin(t / 50.0), 1)
+    fan_b = round(fan_a + 9.0, 1)
+    duty_a = round(16.0 + 4.0 * math.sin(t / 50.0), 1)
+    duty_b = round(duty_a + 0.4, 1)
+
+    pch_signals.extend(
+        [
+            _sig("PCH_SlowPvPowerSum", round(dc_total, 1)),
+            _sig("PCH_AcVoltageAB", v_ab),
+            _sig("PCH_AcVoltageAN", v_an),
+            _sig("PCH_AcVoltageBN", v_bn),
+            _sig("PCH_AcFrequency", freq),
+            _sig("PCH_AcRealPowerAB", round(-st["batt_w"], 1)),
+            _sig("PCH_BatteryPower", round(st["batt_w"], 1)),
+            _sig("PCH_AcMode", 1, "PCH_AcMode_GridFollowing"),
+            _sig("PCH_State", 1, "PCH_State_Running"),
+            _sig("PCH_AmbientTemp", round(44.2 + 2.5 * math.sin(t / 90.0), 1)),
+            _sig("PCH_FanSpeed_A", fan_a),
+            _sig("PCH_FanSpeed_B", fan_b),
+            _sig("PCH_FanDuty_A", duty_a),
+            _sig("PCH_FanDuty_B", duty_b),
+        ]
+    )
+
+    return {
+        "components": {
+            "pch": [{"signals": pch_signals, "activeAlerts": []}],
+            "hvp": [
+                {
+                    "partNumber": "1707000-00-A",
+                    "serialNumber": "TG00000000MOCK",
+                    "signals": [
+                        _sig("HVP_State", 1, "HVP_State_Connected"),
+                        _sig("HVP_PackTempMin", round(33.4 + 1.2 * math.sin(t / 80.0), 1)),
+                        _sig("HVP_PackTempMax", round(37.8 + 1.5 * math.sin(t / 80.0), 1)),
+                        _sig("HVP_ShuntTemperature", round(39.1 + 1.3 * math.sin(t / 80.0), 1)),
+                    ],
+                    "activeAlerts": [],
+                }
+            ],
+            "pws": [
+                {
+                    "signals": [
+                        _sig("PWS_RSD_State", 1, "RSD_State_Armed"),
+                        _sig("PWS_ProdSwitch_State", 1, "PWS_SWITCH_STATE_CLOSED"),
+                        _sig("PWS_SelfTest", 1, "PWS_SelfTest_Passed"),
+                    ],
+                    "activeAlerts": [],
+                }
+            ],
+            "baggr": [
+                {
+                    "signals": [
+                        _sig("BAGGR_State", 1, "BAGGR_State_Running"),
+                        _sig("BAGGR_NumBatteriesConnected", 1),
+                        _sig("BAGGR_NumBatteriesExpected", 1),
+                    ],
+                    "activeAlerts": [],
+                }
+            ],
+            "bms": [
+                {
+                    "signals": [
+                        _sig("BMS_nominalEnergyRemaining", round(st["rem_wh"] / 1000.0, 3)),
+                        _sig("BMS_nominalFullPackEnergy", round(st["full_wh"] / 1000.0, 3)),
+                    ],
+                    "activeAlerts": [],
+                }
+            ],
+        }
+    }
+
+
 def make_handler(expected_pwd, din, force_gzip=False):
     expected_basic = "Basic " + base64.b64encode(
         f"Tesla_Energy_Device:{expected_pwd}".encode()
@@ -121,25 +229,33 @@ def make_handler(expected_pwd, din, force_gzip=False):
                     self._send(400, '{"code":400,"error":"Invalid protobuf envelope"}')
                     return
                 st = simulated_state()
-                # Include realistic esCan padding (~12 KB uncompressed) to test RP2040 streaming
-                payload_json = json.dumps(
-                    {
-                        "esCan": {"bus": {"PINV": [{"isMIA": True, "PINV_Vout": 0}] * 300}},
-                        "control": {
-                            "islanding": {"contactorClosed": True, "gridOK": True},
-                            "meterAggregates": [
-                                {"location": "BATTERY", "realPowerW": st["batt_w"]},
-                                {"location": "SITE", "realPowerW": st["site_w"]},
-                                {"location": "LOAD", "realPowerW": st["load_w"]},
-                                {"location": "SOLAR", "realPowerW": st["solar_w"]},
-                            ],
-                            "systemStatus": {
-                                "nominalEnergyRemainingWh": st["rem_wh"],
-                                "nominalFullPackEnergyWh": st["full_wh"],
-                            },
-                        },
-                    }
+                is_components = (
+                    b"ComponentsQuery" in body
+                    or b"pchSignalNames" in body
+                    or b"PCH_PvVoltageA" in body
                 )
+                if is_components:
+                    payload_json = json.dumps(simulated_components(st))
+                else:
+                    # Include realistic esCan padding (~12 KB uncompressed) to test RP2040 streaming
+                    payload_json = json.dumps(
+                        {
+                            "esCan": {"bus": {"PINV": [{"isMIA": True, "PINV_Vout": 0}] * 300}},
+                            "control": {
+                                "islanding": {"contactorClosed": True, "gridOK": True},
+                                "meterAggregates": [
+                                    {"location": "BATTERY", "realPowerW": st["batt_w"]},
+                                    {"location": "SITE", "realPowerW": st["site_w"]},
+                                    {"location": "LOAD", "realPowerW": st["load_w"]},
+                                    {"location": "SOLAR", "realPowerW": st["solar_w"]},
+                                ],
+                                "systemStatus": {
+                                    "nominalEnergyRemainingWh": st["rem_wh"],
+                                    "nominalFullPackEnergyWh": st["full_wh"],
+                                },
+                            },
+                        }
+                    )
                 pb_resp = wrap_tedapi_response(din, payload_json)
                 self._send(
                     200,
