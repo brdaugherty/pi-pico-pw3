@@ -2,7 +2,7 @@
 # Always-on, low-power Tesla Powerwall 3 dashboard for Raspberry Pi Pico W (RP2040)
 # running Pimoroni MicroPython v1.25.0 + Pimoroni Pico Display Pack 2.8" (320x240).
 #
-# Zero flash writes: 120-sample trend history is held in fixed-size RAM arrays (480 bytes).
+# Zero flash writes: 24-hour trend history (288 x 5-min buckets) in fixed RAM arrays (1.1 KB).
 # Buttons (press A/B/X again to toggle between Primary and Detail views):
 #   A (GP12) : State of Charge (%) trend  <->  Battery & Thermal vitals
 #   B (GP13) : Stored Energy (kWh) trend  <->  Grid, AC Inverter & Safety vitals
@@ -44,6 +44,8 @@ C_AMBER = display.create_pen(255, 190, 40)
 C_RED = display.create_pen(255, 75, 75)
 C_BLUE = display.create_pen(70, 150, 255)
 C_AXIS = display.create_pen(110, 125, 148)
+C_CYAN_DIM = display.create_pen(0, 58, 74)
+C_MAG_DIM = display.create_pen(68, 24, 76)
 
 # Display Pack 2.8" wires RGB LED to GP26, GP27, GP28 (zeroed at boot to stop dim glow)
 led = RGBLED(26, 27, 28)
@@ -55,11 +57,15 @@ btn_x = Pin(14, Pin.IN, Pin.PULL_UP)
 btn_y = Pin(15, Pin.IN, Pin.PULL_UP)
 
 # --- Fixed-Size In-RAM Ring Buffers (Zero Flash Wear, Zero Persistence) ---
-CAP = config.HISTORY_SAMPLES
+# Default: 24h at 5-min buckets = 288 samples (1,152 bytes RAM total).
+HIST_HOURS = getattr(config, "HISTORY_HOURS", 24)
+HIST_STEP_S = getattr(config, "HISTORY_STEP_S", 300)
+CAP = max(2, int((HIST_HOURS * 3600) // HIST_STEP_S))
 hist_soc = array.array("H", [0] * CAP)      # tenths of % (0..1000)
 hist_wh = array.array("H", [0] * CAP)       # tens of Wh  (0..655350 Wh)
 hist_count = 0
 hist_head = 0
+hist_bucket_ms = None
 
 # --- UI & Runtime State ---
 VIEW_SOC = 0
@@ -137,13 +143,29 @@ def update_led():
         led.set_rgb(0, 0, 0)                # off when healthy
 
 
-def push_history(soc_pct, rem_wh):
-    global hist_count, hist_head
-    hist_soc[hist_head] = int(max(0.0, min(100.0, soc_pct)) * 10.0 + 0.5)
-    hist_wh[hist_head] = int(max(0.0, min(655350.0, rem_wh)) / 10.0 + 0.5)
-    hist_head = (hist_head + 1) % CAP
-    if hist_count < CAP:
-        hist_count += 1
+def push_history(soc_pct, rem_wh, now_ms=None):
+    global hist_count, hist_head, hist_bucket_ms
+    if now_ms is None:
+        now_ms = time.ticks_ms()
+    s_val = int(max(0.0, min(100.0, soc_pct)) * 10.0 + 0.5)
+    w_val = int(max(0.0, min(655350.0, rem_wh)) / 10.0 + 0.5)
+    step_ms = HIST_STEP_S * 1000
+    if (
+        hist_count == 0
+        or hist_bucket_ms is None
+        or time.ticks_diff(now_ms, hist_bucket_ms) >= step_ms
+    ):
+        hist_soc[hist_head] = s_val
+        hist_wh[hist_head] = w_val
+        hist_head = (hist_head + 1) % CAP
+        if hist_count < CAP:
+            hist_count += 1
+        hist_bucket_ms = now_ms
+    else:
+        # Keep the live rightmost bucket synced with the latest 30s reading
+        last_idx = (hist_head - 1) % CAP
+        hist_soc[last_idx] = s_val
+        hist_wh[last_idx] = w_val
 
 
 def iter_history(arr):
@@ -194,58 +216,104 @@ def draw_footer():
     draw_text_right(right_info, WIDTH - 6, HEIGHT - 15, scale=1)
 
 
+def _fmt_span_tick(hours_ago):
+    if hours_ago >= 1.0:
+        if abs(hours_ago - int(hours_ago + 0.5)) < 0.05:
+            return "-{}h".format(int(hours_ago + 0.5))
+        return "-{:.1f}h".format(hours_ago)
+    return "-{}m".format(int(hours_ago * 60.0 + 0.5))
+
+
 def draw_chart(is_soc):
     if is_soc:
         val = latest["soc_pct"]
         big = "{:.1f}%".format(val) if val is not None else "--.-%"
         color = C_CYAN
+        fill_col = C_CYAN_DIM
         if val is not None and val < config.LOW_SOC_ALERT_PCT:
             color = C_RED
         draw_header("State of Charge", big, color)
         max_val = 100.0
-        unit = "%"
     else:
         rem = latest["remaining_wh"]
         full = latest["full_wh"] or float(config.DEFAULT_CAPACITY_WH)
         big = "{:.2f}kWh".format(rem / 1000.0) if rem is not None else "--.-kWh"
         color = C_MAGENTA
+        fill_col = C_MAG_DIM
         draw_header("Stored Energy", big, color)
         max_val = max(1.0, full / 1000.0)
-        unit = "kWh"
 
     x0, y0 = 42, 56
     x1, y1 = WIDTH - 10, HEIGHT - 32
     pw = x1 - x0
     ph = y1 - y0
+    span_h = (CAP * HIST_STEP_S) / 3600.0
 
-    for frac in (0.0, 0.5, 1.0):
+    # Shaded area fill first so gridlines & curve stay crisp on top
+    if hist_count > 0:
+        src = hist_soc if is_soc else hist_wh
+        scale_div = 10.0 if is_soc else 100.0
+        step_den = CAP - 1 if CAP > 1 else 1
+        offset = CAP - hist_count
+
+        prev_x = None
+        prev_y = None
+        display.set_pen(fill_col)
+        for idx, raw_v in enumerate(iter_history(src)):
+            ratio = (raw_v / scale_div) / max_val
+            if ratio < 0.0:
+                ratio = 0.0
+            elif ratio > 1.0:
+                ratio = 1.0
+            px = x0 + ((offset + idx) * pw) // step_den
+            py = y1 - int(ratio * ph)
+            if prev_x is not None and px > prev_x:
+                dx = px - prev_x
+                dy = py - prev_y
+                for step in range(1, dx + 1):
+                    fx = prev_x + step
+                    fy = prev_y + (dy * step) // dx
+                    if fy < y1:
+                        display.line(fx, fy, fx, y1 - 1)
+            elif py < y1:
+                display.line(px, py, px, y1 - 1)
+            prev_x, prev_y = px, py
+
+    # Horizontal reference gridlines (0/25/50/75/100%, labeled at 0/50/100%)
+    for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
         gy = y1 - int(frac * ph)
         display.set_pen(C_GRID)
         display.line(x0, gy, x1, gy)
-        lbl_val = max_val * frac
-        lbl = "{:.0f}".format(lbl_val) if max_val >= 10 else "{:.1f}".format(lbl_val)
+        if frac in (0.0, 0.5, 1.0):
+            lbl_val = max_val * frac
+            lbl = "{:.0f}".format(lbl_val) if max_val >= 10 else "{:.1f}".format(lbl_val)
+            display.set_pen(C_MUTED)
+            draw_text_right(lbl, x0 - 4, gy - 4, scale=1)
+
+    # Vertical time gridlines & labels (-24h, -18h, -12h, -6h, now)
+    for frac in (0.25, 0.5, 0.75):
+        gx = x0 + int(frac * pw)
+        display.set_pen(C_GRID)
+        display.line(gx, y0, gx, y1)
+        tick_lbl = _fmt_span_tick(span_h * (1.0 - frac))
+        tw = display.measure_text(tick_lbl, 1)
         display.set_pen(C_MUTED)
-        draw_text_right(lbl, x0 - 4, gy - 4, scale=1)
+        display.text(tick_lbl, gx - tw // 2, y1 + 3, scale=1)
 
     display.set_pen(C_AXIS)
     display.line(x0, y0, x0, y1)
     display.line(x0, y1, x1, y1)
 
-    span_min = (CAP * config.POLL_INTERVAL_S) // 60
     display.set_pen(C_MUTED)
-    display.text("-{}m".format(span_min), x0, y1 + 3, scale=1)
-    draw_text_right("now ({})".format(unit), x1, y1 + 3, scale=1)
+    display.text(_fmt_span_tick(span_h), x0, y1 + 3, scale=1)
+    draw_text_right("now", x1, y1 + 3, scale=1)
 
     if hist_count == 0:
         display.set_pen(C_MUTED)
         display.text("Waiting for PW3 data...", x0 + 36, y0 + ph // 2 - 8, scale=1)
         return
 
-    src = hist_soc if is_soc else hist_wh
-    scale_div = 10.0 if is_soc else 100.0
-    step_den = CAP - 1 if CAP > 1 else 1
-    offset = CAP - hist_count
-
+    # Vivid top curve + live "now" dot
     prev_x = None
     prev_y = None
     display.set_pen(color)
