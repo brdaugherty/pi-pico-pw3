@@ -3,9 +3,9 @@
 # + Pimoroni Pico Display Pack 2.8" (320x240, PEN_P4, zero flash writes).
 #
 # Buttons (press A/B/X again to toggle Primary <-> Detail):
-#   A (GP12) : SoC (%) 24h chart   <->  Battery & Thermal (OOB warning light)
-#   B (GP13) : Stored kWh 24h      <->  Grid & AC Vitals (ieee20305 export limit)
-#   X (GP14) : Live Power Flow     <->  Solar Strings A-F breakdown
+#   A (GP12) : SoC + Batt In/Out 24h <->  Battery & Thermal (OOB warning light)
+#   B (GP13) : Grid In/Out 24h       <->  Grid & AC Vitals (ieee20305 export limit)
+#   X (GP14) : Live Power Flow       <->  Solar Strings A-F breakdown
 #   Y (GP15) : Backlight cycle (Auto-Dim -> Bright -> Off)
 
 import gc
@@ -42,7 +42,6 @@ C_RED = display.create_pen(255, 75, 75)
 C_BLUE = display.create_pen(70, 150, 255)
 C_AXIS = display.create_pen(110, 125, 148)
 C_CYAN_DIM = display.create_pen(0, 58, 74)
-C_MAG_DIM = display.create_pen(68, 24, 76)
 
 led = RGBLED(26, 27, 28)
 led.set_rgb(0, 0, 0)
@@ -52,17 +51,25 @@ btn_b = Pin(13, Pin.IN, Pin.PULL_UP)
 btn_x = Pin(14, Pin.IN, Pin.PULL_UP)
 btn_y = Pin(15, Pin.IN, Pin.PULL_UP)
 
-# 24h in-RAM ring buffers (288 x 5-min buckets = 1.1 KB, zero flash wear)
+# 24h in-RAM ring buffers (288 x 5-min buckets, 5 series = 2.8 KB, zero flash wear)
 HIST_HOURS = getattr(config, "HISTORY_HOURS", 24)
 HIST_STEP_S = getattr(config, "HISTORY_STEP_S", 300)
 CAP = max(2, int((HIST_HOURS * 3600) // HIST_STEP_S))
-hist_soc = array.array("H", [0] * CAP)
-hist_wh = array.array("H", [0] * CAP)
+hist_soc = array.array("H", [0] * CAP)       # tenths of % (0..1000)
+hist_batt_in = array.array("H", [0] * CAP)   # tens of W charging (0..655 kW)
+hist_batt_out = array.array("H", [0] * CAP)  # tens of W discharging
+hist_grid_in = array.array("H", [0] * CAP)   # tens of W importing
+hist_grid_out = array.array("H", [0] * CAP)  # tens of W exporting
 hist_count = 0
 hist_head = 0
 hist_bucket_ms = None
+_bk_n = 0
+_bk_bi = 0.0
+_bk_bo = 0.0
+_bk_gi = 0.0
+_bk_go = 0.0
 
-VIEW_SOC, VIEW_KWH, VIEW_FLOW = 0, 1, 2
+VIEW_SOC, VIEW_GRID, VIEW_FLOW = 0, 1, 2
 VIEW_BATT_DETAIL, VIEW_GRID_DETAIL, VIEW_STRINGS_DETAIL = 3, 4, 5
 view_mode = VIEW_SOC
 
@@ -116,23 +123,43 @@ def update_led():
         led.set_rgb(0, 0, 0)
 
 
-def push_history(soc_pct, rem_wh, now_ms=None):
-    global hist_count, hist_head, hist_bucket_ms
+def _w_to_u16(w):
+    return int(max(0.0, min(655350.0, w)) / 10.0 + 0.5)
+
+
+def push_history(soc_pct, batt_w, site_w, now_ms=None):
+    global hist_count, hist_head, hist_bucket_ms, _bk_n, _bk_bi, _bk_bo, _bk_gi, _bk_go
     if now_ms is None:
         now_ms = time.ticks_ms()
     sv = int(max(0.0, min(100.0, soc_pct)) * 10.0 + 0.5)
-    wv = int(max(0.0, min(655350.0, rem_wh)) / 10.0 + 0.5)
+    bw = batt_w or 0.0
+    sw = site_w or 0.0
+    bi = -bw if bw < 0.0 else 0.0
+    bo = bw if bw > 0.0 else 0.0
+    gi = sw if sw > 0.0 else 0.0
+    go = -sw if sw < 0.0 else 0.0
+
     if hist_count == 0 or hist_bucket_ms is None or time.ticks_diff(now_ms, hist_bucket_ms) >= HIST_STEP_S * 1000:
-        hist_soc[hist_head] = sv
-        hist_wh[hist_head] = wv
+        _bk_n = 1
+        _bk_bi, _bk_bo, _bk_gi, _bk_go = bi, bo, gi, go
+        idx = hist_head
         hist_head = (hist_head + 1) % CAP
         if hist_count < CAP:
             hist_count += 1
         hist_bucket_ms = now_ms
     else:
-        li = (hist_head - 1) % CAP
-        hist_soc[li] = sv
-        hist_wh[li] = wv
+        _bk_n += 1
+        _bk_bi += bi
+        _bk_bo += bo
+        _bk_gi += gi
+        _bk_go += go
+        idx = (hist_head - 1) % CAP
+
+    hist_soc[idx] = sv
+    hist_batt_in[idx] = _w_to_u16(_bk_bi / _bk_n)
+    hist_batt_out[idx] = _w_to_u16(_bk_bo / _bk_n)
+    hist_grid_in[idx] = _w_to_u16(_bk_gi / _bk_n)
+    hist_grid_out[idx] = _w_to_u16(_bk_go / _bk_n)
 
 
 def iter_history(arr):
@@ -181,7 +208,7 @@ def draw_footer():
     display.set_pen(C_RED if status_is_err else C_MUTED)
     display.text(status_msg[:22], 20, HEIGHT - 15, scale=1)
     la = "A:BAT" if view_mode == VIEW_SOC else "A:SOC"
-    lb = "B:GRD" if view_mode == VIEW_KWH else "B:kWh"
+    lb = "B:AC" if view_mode == VIEW_GRID else "B:GRD"
     lx = "X:STR" if view_mode == VIEW_FLOW else "X:PWR"
     display.set_pen(C_MUTED)
     draw_text_right("{}  {} {} {}".format(latest["time_str"] or "--:--", la, lb, lx), WIDTH - 6, HEIGHT - 15, scale=1)
@@ -193,30 +220,28 @@ def _fmt_span(h):
     return "-{}m".format(int(h * 60.0 + 0.5))
 
 
-def draw_chart(is_soc):
-    if is_soc:
-        v = latest["soc_pct"]
-        col = C_RED if (v is not None and v < config.LOW_SOC_ALERT_PCT) else C_CYAN
-        fill_col = C_CYAN_DIM
-        draw_header("State of Charge", "{:.1f}%".format(v) if v is not None else "--.-%", col)
-        max_v, sdiv, src = 100.0, 10.0, hist_soc
-    else:
-        rem = latest["remaining_wh"]
-        full = latest["full_wh"] or float(config.DEFAULT_CAPACITY_WH)
-        col, fill_col = C_MAGENTA, C_MAG_DIM
-        draw_header("Stored Energy", "{:.2f}kWh".format(rem / 1000.0) if rem is not None else "--.-kWh", col)
-        max_v, sdiv, src = max(1.0, full / 1000.0), 100.0, hist_wh
+def _nice_kw_max(arr_a, arr_b, floor_kw=4.0):
+    pk = 0
+    for v in iter_history(arr_a):
+        if v > pk:
+            pk = v
+    for v in iter_history(arr_b):
+        if v > pk:
+            pk = v
+    pk_kw = pk / 100.0
+    for step in (2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0, 25.0):
+        if step >= floor_kw and step >= pk_kw * 1.05:
+            return step
+    return max(floor_kw, float(int(pk_kw) + 2))
 
-    x0, y0, x1, y1 = 42, 56, WIDTH - 10, HEIGHT - 32
-    pw, ph = x1 - x0, y1 - y0
-    span_h = (CAP * HIST_STEP_S) / 3600.0
+
+def _draw_series(arr, x0, y1, pw, ph, sdiv, max_v, col, fill_col=None):
     step_den = CAP - 1 if CAP > 1 else 1
     offset = CAP - hist_count
-
-    if hist_count > 0:
+    if fill_col is not None:
         px_p, py_p = None, None
         display.set_pen(fill_col)
-        for idx, rv in enumerate(iter_history(src)):
+        for idx, rv in enumerate(iter_history(arr)):
             r = max(0.0, min(1.0, (rv / sdiv) / max_v))
             px = x0 + ((offset + idx) * pw) // step_den
             py = y1 - int(r * ph)
@@ -229,38 +254,10 @@ def draw_chart(is_soc):
             elif py < y1:
                 display.line(px, py, px, y1 - 1)
             px_p, py_p = px, py
-
-    for f in (0.0, 0.25, 0.5, 0.75, 1.0):
-        gy = y1 - int(f * ph)
-        display.set_pen(C_GRID)
-        display.line(x0, gy, x1, gy)
-        if f in (0.0, 0.5, 1.0):
-            lv = max_v * f
-            display.set_pen(C_MUTED)
-            draw_text_right("{:.0f}".format(lv) if max_v >= 10 else "{:.1f}".format(lv), x0 - 4, gy - 4, scale=1)
-
-    for f in (0.25, 0.5, 0.75):
-        gx = x0 + int(f * pw)
-        display.set_pen(C_GRID)
-        display.line(gx, y0, gx, y1)
-        tl = _fmt_span(span_h * (1.0 - f))
-        display.set_pen(C_MUTED)
-        display.text(tl, gx - display.measure_text(tl, 1) // 2, y1 + 3, scale=1)
-
-    display.set_pen(C_AXIS)
-    display.line(x0, y0, x0, y1)
-    display.line(x0, y1, x1, y1)
-    display.set_pen(C_MUTED)
-    display.text(_fmt_span(span_h), x0, y1 + 3, scale=1)
-    draw_text_right("now", x1, y1 + 3, scale=1)
-
-    if hist_count == 0:
-        display.text("Waiting for PW3 data...", x0 + 36, y0 + ph // 2 - 8, scale=1)
         return
-
     px_p, py_p = None, None
     display.set_pen(col)
-    for idx, rv in enumerate(iter_history(src)):
+    for idx, rv in enumerate(iter_history(arr)):
         r = max(0.0, min(1.0, (rv / sdiv) / max_v))
         px = x0 + ((offset + idx) * pw) // step_den
         py = y1 - int(r * ph)
@@ -270,8 +267,97 @@ def draw_chart(is_soc):
             display.circle(px, py, 2)
         px_p, py_p = px, py
     if px_p is not None:
-        display.set_pen(C_TEXT)
-        display.circle(px_p, py_p, 3)
+        display.set_pen(col)
+        display.circle(px_p, py_p, 2)
+
+
+def _draw_chart_grid(x0, y0, x1, y1, left_max, left_col, right_max=None):
+    pw, ph = x1 - x0, y1 - y0
+    span_h = (CAP * HIST_STEP_S) / 3600.0
+    for f in (0.0, 0.25, 0.5, 0.75, 1.0):
+        gy = y1 - int(f * ph)
+        display.set_pen(C_GRID)
+        display.line(x0, gy, x1, gy)
+        if f in (0.0, 0.5, 1.0):
+            lv = left_max * f
+            display.set_pen(left_col)
+            draw_text_right("{:.0f}".format(lv) if lv == int(lv) else "{:.1f}".format(lv), x0 - 3, gy - 4, scale=1)
+            if right_max is not None:
+                rv = right_max * f
+                rlbl = "{:.0f}k".format(rv) if (rv == int(rv)) else "{:.1f}k".format(rv)
+                display.set_pen(C_MUTED)
+                display.text(rlbl, x1 + 3, gy - 4, scale=1)
+    for f in (0.25, 0.5, 0.75):
+        gx = x0 + int(f * pw)
+        display.set_pen(C_GRID)
+        display.line(gx, y0, gx, y1)
+        tl = _fmt_span(span_h * (1.0 - f))
+        display.set_pen(C_MUTED)
+        display.text(tl, gx - display.measure_text(tl, 1) // 2, y1 + 3, scale=1)
+    display.set_pen(C_AXIS)
+    display.line(x0, y0, x0, y1)
+    display.line(x0, y1, x1, y1)
+    if right_max is not None:
+        display.line(x1, y0, x1, y1)
+    display.set_pen(C_MUTED)
+    display.text(_fmt_span(span_h), x0, y1 + 3, scale=1)
+    draw_text_right("now", x1, y1 + 3, scale=1)
+
+
+def _legend_item(x, y, col, label):
+    display.set_pen(col)
+    display.rectangle(x, y + 1, 6, 6)
+    display.text(label, x + 9, y, scale=1)
+
+
+def draw_chart(is_soc):
+    if is_soc:
+        v = latest["soc_pct"]
+        col = C_RED if (v is not None and v < config.LOW_SOC_ALERT_PCT) else C_CYAN
+        draw_header("SoC & Batt kW", "{:.1f}%".format(v) if v is not None else "--.-%", col)
+        bw = latest["batt_w"] or 0.0
+        bi_kw = (-bw / 1000.0) if bw < 0.0 else 0.0
+        bo_kw = (bw / 1000.0) if bw > 0.0 else 0.0
+        _legend_item(10, 49, col, "SOC%")
+        _legend_item(74, 49, C_GREEN, "IN:{:.1f}kW".format(bi_kw))
+        _legend_item(176, 49, C_AMBER, "OUT:{:.1f}kW".format(bo_kw))
+
+        x0, y0, x1, y1 = 30, 61, 286, HEIGHT - 32
+        pw, ph = x1 - x0, y1 - y0
+        pmax = _nice_kw_max(hist_batt_in, hist_batt_out, 4.0)
+        if hist_count > 0:
+            _draw_series(hist_soc, x0, y1, pw, ph, 10.0, 100.0, col, fill_col=C_CYAN_DIM)
+        _draw_chart_grid(x0, y0, x1, y1, 100.0, C_CYAN, right_max=pmax)
+        if hist_count == 0:
+            display.set_pen(C_MUTED)
+            display.text("Waiting for PW3 data...", x0 + 36, y0 + ph // 2 - 8, scale=1)
+            return
+        _draw_series(hist_soc, x0, y1, pw, ph, 10.0, 100.0, col)
+        _draw_series(hist_batt_in, x0, y1, pw, ph, 100.0, pmax, C_GREEN)
+        _draw_series(hist_batt_out, x0, y1, pw, ph, 100.0, pmax, C_AMBER)
+    else:
+        sw = latest["site_w"]
+        hcol = C_MUTED if sw is None else (C_GREEN if sw < -50 else (C_AMBER if sw > 50 else C_CYAN))
+        big = "{:+.1f}kW".format(sw / 1000.0) if sw is not None else "--.-kW"
+        draw_header("Grid In / Out", big, hcol)
+        sval = sw or 0.0
+        gi_kw = (sval / 1000.0) if sval > 0.0 else 0.0
+        go_kw = (-sval / 1000.0) if sval < 0.0 else 0.0
+        _legend_item(10, 49, C_AMBER, "IN:{:.2f}kW".format(gi_kw))
+        _legend_item(128, 49, C_GREEN, "OUT:{:.2f}kW".format(go_kw))
+        display.set_pen(C_MUTED)
+        draw_text_right("kW", WIDTH - 10, 49, scale=1)
+
+        x0, y0, x1, y1 = 34, 61, WIDTH - 10, HEIGHT - 32
+        pw, ph = x1 - x0, y1 - y0
+        pmax = _nice_kw_max(hist_grid_in, hist_grid_out, 2.0)
+        _draw_chart_grid(x0, y0, x1, y1, pmax, C_MUTED)
+        if hist_count == 0:
+            display.set_pen(C_MUTED)
+            display.text("Waiting for PW3 data...", x0 + 36, y0 + ph // 2 - 8, scale=1)
+            return
+        _draw_series(hist_grid_in, x0, y1, pw, ph, 100.0, pmax, C_AMBER)
+        _draw_series(hist_grid_out, x0, y1, pw, ph, 100.0, pmax, C_GREEN)
 
 
 def draw_power_flow():
@@ -523,7 +609,7 @@ def draw_ui():
     display.clear()
     if view_mode == VIEW_SOC:
         draw_chart(True)
-    elif view_mode == VIEW_KWH:
+    elif view_mode == VIEW_GRID:
         draw_chart(False)
     elif view_mode == VIEW_FLOW:
         draw_power_flow()
@@ -686,7 +772,7 @@ def main():
                 elif i == 0:
                     view_mode = VIEW_BATT_DETAIL if view_mode == VIEW_SOC else VIEW_SOC
                 elif i == 1:
-                    view_mode = VIEW_GRID_DETAIL if view_mode == VIEW_KWH else VIEW_KWH
+                    view_mode = VIEW_GRID_DETAIL if view_mode == VIEW_GRID else VIEW_GRID
                 elif i == 2:
                     view_mode = VIEW_STRINGS_DETAIL if view_mode == VIEW_FLOW else VIEW_FLOW
                 elif i == 3:
@@ -726,7 +812,7 @@ def main():
                         latest["time_str"] = d["time_str"]
                     d = None
                     gc.collect()
-                    push_history(latest["soc_pct"], latest["remaining_wh"])
+                    push_history(latest["soc_pct"], latest["batt_w"], latest["site_w"])
                     consec_errors = 0
                     cooldown_until_ms = None
                     status_msg, status_is_err = "OK (TEDAPI)", False
