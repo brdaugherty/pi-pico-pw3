@@ -355,12 +355,35 @@ def _scan_stream_for_metrics(reader, metrics, chunk_size=1024, wdt_feed=None):
             if b is not None:
                 metrics["grid_ok"] = b
 
+        if metrics.get("site_shutdown") is None:
+            b = _extract_bool_after(window, b'"isShutDown"')
+            if b is not None:
+                metrics["site_shutdown"] = b
+
         if metrics.get("sys_time") is None:
             spos = window.find(b'"system"')
             if spos >= 0:
                 ts = _extract_string_after(window, b'"time"', spos)
                 if ts:
                     metrics["sys_time"] = ts
+
+        if metrics.get("exp_lim_default_w") is None:
+            dpos = window.find(b'"defaultControl"')
+            if dpos >= 0:
+                hi = window.find(b"}", dpos)
+                if hi > dpos:
+                    v = _extract_number_after(window[dpos:hi + 1], b'"opModExpLimW"')
+                    if v is not None:
+                        metrics["exp_lim_default_w"] = v
+
+        if metrics.get("exp_lim_active_w") is None:
+            apos = window.find(b'"activeControls"')
+            if apos >= 0:
+                hi = window.find(b"}", apos)
+                if hi > apos:
+                    v = _extract_number_after(window[apos:hi + 1], b'"opModExpLimW"')
+                    if v is not None:
+                        metrics["exp_lim_active_w"] = v
 
         for loc_tok, mkey in meter_keys:
             if metrics[mkey] is None:
@@ -377,8 +400,8 @@ def _scan_stream_for_metrics(reader, metrics, chunk_size=1024, wdt_feed=None):
 
         if not chunk:
             break
-        if len(window) > 192:
-            window = window[-192:]
+        if len(window) > 320:
+            window = window[-320:]
 
 
 _STRING_LETTERS = ("A", "B", "C", "D", "E", "F")
@@ -387,6 +410,8 @@ _COMP_NUM_SIGNALS = {
     "HVP_PackTempMin": ("pack_temp_min", "min"),
     "HVP_PackTempMax": ("pack_temp_max", "max"),
     "HVP_ShuntTemperature": ("shunt_temp", "max"),
+    "BMS_LOG_tempOutOfBounds": ("temp_oob", "sum"),
+    "BMS_LOG_tempOutOfBoundsCharge": ("temp_oob_chg", "sum"),
     "PCH_AmbientTemp": ("inv_ambient_temp", "set"),
     "PCH_FanSpeed_A": ("fan_rpm_a", "set"),
     "PCH_FanSpeed_B": ("fan_rpm_b", "set"),
@@ -425,6 +450,8 @@ def _new_components_dict():
         "pack_temp_min": None,
         "pack_temp_max": None,
         "shunt_temp": None,
+        "temp_oob": None,
+        "temp_oob_chg": None,
         "inv_ambient_temp": None,
         "fan_rpm_a": None,
         "fan_rpm_b": None,
@@ -490,6 +517,8 @@ def _apply_component_object(obj, comp):
                 comp[dest_key] = v
             elif mode == "max" and v > cur:
                 comp[dest_key] = v
+            elif mode == "sum":
+                comp[dest_key] = cur + v
         return
 
     text_key = _COMP_TEXT_SIGNALS.get(name)
@@ -808,6 +837,10 @@ class Powerwall3Client:
             "load_w": None,
             "site_w": None,
             "grid_ok": None,
+            "site_shutdown": None,
+            "exp_lim_default_w": None,
+            "exp_lim_active_w": None,
+            "exp_lim_w": None,
             "sys_time": None,
             "time_str": None,
         }
@@ -831,6 +864,10 @@ class Powerwall3Client:
         raw_soc = (rem / full) * 100.0
         metrics["soc_raw"] = raw_soc
         metrics["soc_pct"] = scale_soc_to_app(raw_soc) if self.soc_scale_to_app else raw_soc
+        exp_lim = metrics["exp_lim_active_w"]
+        if exp_lim is None:
+            exp_lim = metrics["exp_lim_default_w"]
+        metrics["exp_lim_w"] = exp_lim
         metrics["time_str"] = (
             _parse_iso_hhmm(metrics["sys_time"], self.utc_offset_hours)
             or _parse_date_hhmm(resp_hdrs.get("date"), self.utc_offset_hours)

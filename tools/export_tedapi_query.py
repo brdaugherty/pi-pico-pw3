@@ -36,6 +36,10 @@ EXTRA_COMPONENT_SIGNALS = {
         "HVP_PackTempMax",
         "HVP_ShuntTemperature",
     ),
+    "bmsSignalNames": (
+        "BMS_LOG_tempOutOfBounds",
+        "BMS_LOG_tempOutOfBoundsCharge",
+    ),
     "pwsSignalNames": (
         "PWS_RSD_State",
     ),
@@ -258,8 +262,8 @@ def _capture_via_mock_tedapi():
             gw = TEDAPI(gw_pwd="DUMMY_GW_PASSWORD")
         gw.din = dummy_din
         for method_name in (
-            "get_status",
             "get_device_controller",
+            "get_status",
             "get_components",
             "get_blocks",
         ):
@@ -274,17 +278,19 @@ def _capture_via_mock_tedapi():
     finally:
         requests.Session.request = orig_request
 
-    status_f16 = None
+    status_full_f16 = None
+    status_basic_f16 = None
     comp_f16 = None
     for raw_pb in captured:
         try:
             f16 = _extract_field16_from_tedapi_msg(raw_pb)
             if not f16:
                 continue
-            if status_f16 is None and (
-                b"DeviceControllerQuery" in f16 or b"nominalFullPackEnergyWh" in f16
-            ):
-                status_f16 = f16
+            if b"DeviceControllerQuery" in f16 or b"nominalFullPackEnergyWh" in f16:
+                if b"ieee20305" in f16 and status_full_f16 is None:
+                    status_full_f16 = f16
+                elif status_basic_f16 is None:
+                    status_basic_f16 = f16
             elif comp_f16 is None and (
                 b"ComponentsQuery" in f16
                 or b"pchSignalNames" in f16
@@ -293,7 +299,7 @@ def _capture_via_mock_tedapi():
                 comp_f16 = _ensure_extra_component_signals(f16)
         except Exception:
             continue
-    return status_f16, comp_f16
+    return status_full_f16 or status_basic_f16, comp_f16
 
 
 # --- Strategy 2: Scan query JSON / files on disk inside pypowerwall/tedapi/ ---
@@ -309,7 +315,8 @@ def _scan_query_json(pkg_dir):
     except Exception:
         return None, None
 
-    rec = data.get("device_controller_basic") or data.get("device_controller_full")
+    # Prefer device_controller_full so ieee20305 export limits are included
+    rec = data.get("device_controller_full") or data.get("device_controller_basic")
     if isinstance(rec, dict) and rec.get("text") and rec.get("code"):
         try:
             q_bytes = rec["text"].encode("utf-8")
@@ -421,9 +428,9 @@ def main():
 
     gql_payload, comp_payload = _capture_via_mock_tedapi()
     method = "TEDAPI wire capture"
-    if not gql_payload or not comp_payload:
+    if not gql_payload or (b"ieee20305" not in gql_payload) or not comp_payload:
         fb_gql, fb_comp = _scan_files_on_disk(pkg_dir)
-        if not gql_payload and fb_gql:
+        if fb_gql and (not gql_payload or (b"ieee20305" not in gql_payload and b"ieee20305" in fb_gql)):
             gql_payload = fb_gql
             method = "query JSON / file scan"
         if not comp_payload and fb_comp:
@@ -459,11 +466,13 @@ def main():
         f.write("COMPONENTS_QUERY_SIG = b''\n")
         f.write('COMPONENTS_QUERY_VARS = b"{}"\n')
 
+    has_ieee = b"ieee20305" in gql_payload
+    has_oob = bool(comp_payload and b"BMS_LOG_tempOutOfBounds" in comp_payload)
     print(f"Success! Wrote {out_path}")
     print(f"  pypowerwall        : v{version}")
     print(f"  Extraction mode    : {method}")
-    print(f"  GRAPHQL_PAYLOAD    : {len(gql_payload)} bytes")
-    print(f"  COMPONENTS_PAYLOAD : {len(comp_payload) if comp_payload else 0} bytes")
+    print(f"  GRAPHQL_PAYLOAD    : {len(gql_payload)} bytes (ieee20305: {'yes' if has_ieee else 'no'})")
+    print(f"  COMPONENTS_PAYLOAD : {len(comp_payload) if comp_payload else 0} bytes (tempOutOfBounds: {'yes' if has_oob else 'no'})")
     if not comp_payload:
         print("  WARNING: ComponentsQuery payload was not found; upgrade pypowerwall (`pip install -U pypowerwall`) for Strings/Vitals detail views.")
     print("Upload tedapi_query.py to your Pico W in Thonny alongside main.py, config.py, and powerwall_api.py.")

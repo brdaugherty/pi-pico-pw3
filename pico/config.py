@@ -22,6 +22,7 @@ RATE_LIMIT_COOLDOWN_S = 300      # 5-minute cooldown if gateway returns HTTP 429
 SOC_SCALE_TO_APP = True          # True = Tesla App SoC ((raw - 5) / 0.95); False = raw physical SoC
 DEFAULT_CAPACITY_WH = 13500      # Fallback until first nominalFullPackEnergyWh reading (auto-scales)
 HISTORY_SAMPLES = 120            # In-RAM ring buffer (120 * 30s = 60 min; 480 bytes RAM; no flash writes)
+EXPORT_LIMIT_W = 0               # Optional fallback grid-export cap in W if utility doesn't send ieee20305 (0 = auto only)
 
 # --- Clock Display (uses PW3 local system.time + auto DST; fallback to HTTP Date) ---
 UTC_OFFSET_HOURS = 0             # Fallback offset if system.time is absent (e.g., -8 PST)

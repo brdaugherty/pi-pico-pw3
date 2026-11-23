@@ -86,15 +86,14 @@ latest = {
     "load_w": None,
     "site_w": None,
     "grid_ok": None,
+    "site_shutdown": None,
+    "exp_lim_w": None,
     "time_str": "--:--",
 }
 comp_data = None
 comp_last_ms = None
 comp_poll_pending = False
 cooldown_until_ms = None
-ALERT_TICK_MS = 3000
-alert_idx = 0
-last_alert_tick_ms = time.ticks_ms()
 
 status_msg = "BOOTING PW3..."
 status_is_err = False
@@ -359,27 +358,25 @@ def _draw_detail_card(cx, cy, cw, ch, col, title, main_str, sub_str):
     display.text(sub_str[:21], cx + 10, cy + 42, scale=1)
 
 
-def _draw_alerts_bar(alerts, extra_right=""):
+def _draw_warning_bar(sev_col, left_text, right_text=""):
+    """Car-warning-light status bar: always visible, green/amber/red by severity."""
     bx, by, bw, bh = 10, 184, WIDTH - 20, 28
     display.set_pen(C_PANEL)
     display.rectangle(bx, by, bw, bh)
-    if alerts:
-        display.set_pen(C_RED)
-        display.rectangle(bx, by, 4, bh)
-        n = len(alerts)
-        if n == 1:
-            msg = "ALERT: {}".format(alerts[0])
-        else:
-            idx = alert_idx % n
-            msg = "ALRT {}/{}: {}".format(idx + 1, n, alerts[idx])
-        display.text(msg[:46], bx + 10, by + 10, scale=1)
-    else:
-        display.set_pen(C_GREEN)
-        display.rectangle(bx, by, 4, bh)
-        display.set_pen(C_MUTED)
-        display.text("ALERTS: NONE", bx + 10, by + 10, scale=1)
-        if extra_right:
-            draw_text_right(extra_right[:26], bx + bw - 8, by + 10, scale=1)
+    display.set_pen(sev_col)
+    display.rectangle(bx, by, 4, bh)
+    display.circle(bx + 13, by + 14, 4)
+    display.text(left_text[:25], bx + 22, by + 10, scale=1)
+    if right_text:
+        draw_text_right(right_text[:20], bx + bw - 8, by + 10, scale=1)
+
+
+def _sev_color(sev):
+    if sev >= 2:
+        return C_RED
+    if sev == 1:
+        return C_AMBER
+    return C_GREEN
 
 
 def draw_batt_detail():
@@ -387,10 +384,10 @@ def draw_batt_detail():
     tmax = c["pack_temp_max"] if c else None
     big = "{:.1f}C".format(tmax) if tmax is not None else "--.-C"
     if tmax is None:
-        hdr_col = C_CYAN
+        hdr_col = C_GREEN
     elif tmax >= 50.0:
         hdr_col = C_RED
-    elif tmax >= 40.0:
+    elif tmax >= 42.0:
         hdr_col = C_AMBER
     else:
         hdr_col = C_GREEN
@@ -403,18 +400,31 @@ def draw_batt_detail():
 
     tmin = c["pack_temp_min"]
     shunt = c["shunt_temp"]
+    dt = (tmax - tmin) if (tmax is not None and tmin is not None) else None
     temp_main = "{:.1f} C".format(tmax) if tmax is not None else "--.- C"
     tmin_s = "{:.1f}".format(tmin) if tmin is not None else "--"
     shunt_s = "{:.1f}".format(shunt) if shunt is not None else "--"
+    if tmax is not None and tmax >= 50.0:
+        pack_sev = 2
+    elif (tmax is not None and tmax >= 42.0) or (dt is not None and dt >= 7.0):
+        pack_sev = 1
+    else:
+        pack_sev = 0
     _draw_detail_card(
-        10, 54, 145, 58, C_CYAN, "PACK TEMP MAX", temp_main,
+        10, 54, 145, 58, _sev_color(pack_sev), "PACK TEMP MAX", temp_main,
         "MIN {}C  SH {}C".format(tmin_s, shunt_s),
     )
 
     amb = c["inv_ambient_temp"]
     amb_main = "{:.1f} C".format(amb) if amb is not None else "--.- C"
+    if amb is not None and amb >= 65.0:
+        amb_sev = 2
+    elif amb is not None and amb >= 55.0:
+        amb_sev = 1
+    else:
+        amb_sev = 0
     _draw_detail_card(
-        165, 54, 145, 58, C_AMBER, "INV AMBIENT", amb_main,
+        165, 54, 145, 58, _sev_color(amb_sev), "INV AMBIENT", amb_main,
         "HVP: " + _short_state(c["hvp_state"], 15),
     )
 
@@ -428,12 +438,25 @@ def draw_batt_detail():
         fan_main = "{} RPM".format(int(fa + 0.5))
     else:
         fan_main = "-- RPM"
+    fan_max = None
+    if da is not None and db is not None:
+        fan_max = da if da >= db else db
+    elif da is not None:
+        fan_max = da
+    elif db is not None:
+        fan_max = db
+    if fan_max is not None and fan_max >= 90.0:
+        fan_sev = 2
+    elif fan_max is not None and fan_max >= 75.0:
+        fan_sev = 1
+    else:
+        fan_sev = 0
     fa_s = str(int(fa + 0.5)) if fa is not None else "--"
     fb_s = str(int(fb + 0.5)) if fb is not None else "--"
     da_s = "{}%".format(int(da + 0.5)) if da is not None else "--"
     db_s = "{}%".format(int(db + 0.5)) if db is not None else "--"
     _draw_detail_card(
-        10, 118, 145, 58, C_BLUE, "COOLING FANS", fan_main,
+        10, 118, 145, 58, _sev_color(fan_sev), "COOLING FANS", fan_main,
         "A:{}({}) B:{}({})".format(fa_s, da_s, fb_s, db_s),
     )
 
@@ -458,8 +481,28 @@ def draw_batt_detail():
         165, 118, 145, 58, batt_col, "BATT DC PWR", fmt_kw(batt_dc), batt_sub,
     )
 
-    free_kb = gc.mem_free() // 1024
-    _draw_alerts_bar(c["alerts"], "RAM: {}KB free".format(free_kb))
+    oob_a = c["temp_oob"]
+    oob_b = c["temp_oob_chg"]
+    if oob_a is not None or oob_b is not None:
+        oob_total = int((oob_a or 0) + (oob_b or 0))
+        oob_s = str(oob_total)
+        oob_sev = 2 if oob_total > 0 else 0
+    else:
+        oob_total = None
+        oob_s = "--"
+        oob_sev = 0
+
+    therm_sev = max(pack_sev, amb_sev, fan_sev, oob_sev)
+    if oob_sev == 2:
+        left_lbl = "OOB TEMP WARN!"
+    elif therm_sev == 2:
+        left_lbl = "OVER-TEMP WARN!"
+    elif therm_sev == 1:
+        left_lbl = "THERMAL: WARM"
+    else:
+        left_lbl = "THERMAL: OK"
+    dt_s = "{:.1f}C".format(dt) if dt is not None else "--"
+    _draw_warning_bar(_sev_color(therm_sev), left_lbl, "dT:{}  OOB:{}".format(dt_s, oob_s))
 
 
 def draw_grid_detail():
@@ -476,19 +519,31 @@ def draw_grid_detail():
 
     van = c["ac_v_an"]
     vbn = c["ac_v_bn"]
+    dv = abs(van - vbn) if (van is not None and vbn is not None) else None
     v_main = "{:.1f} V".format(vab) if vab is not None else "--.- V"
     l1_s = "{:.1f}".format(van) if van is not None else "--"
     l2_s = "{:.1f}".format(vbn) if vbn is not None else "--"
+    if vab is not None and (vab >= 254.0 or vab <= 222.0):
+        v_sev = 2
+    elif (vab is not None and (vab >= 250.0 or vab <= 228.0)) or (dv is not None and dv >= 4.0):
+        v_sev = 1
+    else:
+        v_sev = 0
     _draw_detail_card(
-        10, 54, 145, 58, C_CYAN, "AC SPLIT-PHASE", v_main,
+        10, 54, 145, 58, _sev_color(v_sev), "AC SPLIT-PHASE", v_main,
         "L1:{}V  L2:{}V".format(l1_s, l2_s),
     )
 
     freq = c["ac_freq"]
     f_main = "{:.2f}Hz".format(freq) if freq is not None else "--.--Hz"
-    f_col = C_GREEN if (freq is not None and 59.5 <= freq <= 60.5) else C_AMBER
+    if freq is not None and (freq >= 60.5 or freq <= 59.3):
+        f_sev = 2
+    elif freq is not None and (freq >= 60.2 or freq <= 59.8):
+        f_sev = 1
+    else:
+        f_sev = 0
     grid_sub = "GRID: OK" if latest["grid_ok"] is not False else "GRID: ISLAND"
-    _draw_detail_card(165, 54, 145, 58, f_col, "FREQUENCY", f_main, grid_sub)
+    _draw_detail_card(165, 54, 145, 58, _sev_color(f_sev), "FREQUENCY", f_main, grid_sub)
 
     ac_w = c["ac_power_w"] if c["ac_power_w"] is not None else c["pch_batt_w"]
     _draw_detail_card(
@@ -516,7 +571,48 @@ def draw_grid_detail():
         "{} HOME:{}".format(gdir, home_s),
     )
 
-    _draw_alerts_bar(c["alerts"], "TEST: " + _short_state(c["self_test"], 16))
+    # Bottom car-warning-light bar: Export Limit Headroom + Grid Compliance
+    exp_lim = latest["exp_lim_w"]
+    if exp_lim is None:
+        cfg_lim = getattr(config, "EXPORT_LIMIT_W", 0)
+        if cfg_lim and cfg_lim > 0:
+            exp_lim = float(cfg_lim)
+    export_w = -site_w if (site_w is not None and site_w < 0.0) else 0.0
+
+    if exp_lim is not None and exp_lim > 0.0:
+        exp_pct = int((export_w / exp_lim) * 100.0 + 0.5)
+        left_lbl = "EXP:{:.1f}/{:.1f}kW ({}%)".format(
+            export_w / 1000.0, exp_lim / 1000.0, exp_pct
+        )
+        exp_sev = 2 if exp_pct >= 95 else (1 if exp_pct >= 80 else 0)
+    elif exp_lim == 0:
+        left_lbl = "EXP LIM: 0kW"
+        exp_sev = 2 if export_w >= 200.0 else (1 if export_w >= 50.0 else 0)
+    else:
+        left_lbl = "EXP LIM: --"
+        exp_sev = 0
+
+    shut_sev = 2 if latest["site_shutdown"] is True else 0
+    comp_sev = max(v_sev, f_sev, shut_sev)
+    if shut_sev == 2:
+        right_lbl = "SHUTDOWN!"
+    elif v_sev == 2:
+        right_lbl = "V OUT!"
+    elif f_sev == 2:
+        right_lbl = "CURTAIL!" if (freq is not None and freq >= 60.5) else "FREQ!"
+    elif v_sev == 1:
+        if vab is not None and vab >= 250.0:
+            right_lbl = "V HIGH"
+        elif vab is not None and vab <= 228.0:
+            right_lbl = "V LOW"
+        else:
+            right_lbl = "dV:{:.1f}V".format(dv)
+    elif f_sev == 1:
+        right_lbl = "FREQ WARN"
+    else:
+        right_lbl = "OK dV:{:.1f}V".format(dv) if dv is not None else "GRID OK"
+
+    _draw_warning_bar(_sev_color(max(exp_sev, comp_sev)), left_lbl, right_lbl)
 
 
 def draw_strings_detail():
@@ -737,7 +833,6 @@ def ensure_wifi(wlan, wdt_feed):
 def main():
     global view_mode, bl_mode, last_input_ms, status_msg, status_is_err, consec_errors
     global comp_data, comp_last_ms, comp_poll_pending, cooldown_until_ms
-    global alert_idx, last_alert_tick_ms
 
     set_backlight(config.BACKLIGHT_ACTIVE)
     draw_ui()
@@ -778,34 +873,27 @@ def main():
 
     def _run_components_poll():
         global comp_data, comp_last_ms, comp_poll_pending, cooldown_until_ms
-        global status_msg, status_is_err, consec_errors, alert_idx, last_alert_tick_ms
+        global status_msg, status_is_err, consec_errors
         try:
             c = client.poll_components(wdt_feed=wdt_feed)
             comp_data = c
             comp_last_ms = time.ticks_ms()
             comp_poll_pending = False
-            if c["alerts"]:
-                alert_idx %= len(c["alerts"])
-            else:
-                alert_idx = 0
-            last_alert_tick_ms = comp_last_ms
             if c.get("time_str") and latest["time_str"] == "--:--":
                 latest["time_str"] = c["time_str"]
             status_msg = "OK (VITALS)"
             status_is_err = False
             print(
-                "VITALS: DC={:.0f}W VAB={}V FREQ={}Hz TMAX={}C RSD={} ALERTS={} FREE={}B".format(
+                "VITALS: DC={:.0f}W VAB={}V FREQ={}Hz TMAX={}C OOB={}/{} FREE={}B".format(
                     c["strings_dc_w"],
                     c["ac_v_ab"],
                     c["ac_freq"],
                     c["pack_temp_max"],
-                    c["rsd_state"],
-                    len(c["alerts"]),
+                    c["temp_oob"],
+                    c["temp_oob_chg"],
                     gc.mem_free(),
                 )
             )
-            if c["alerts"]:
-                print("ACTIVE ALERTS (0-9):", c["alerts"])
             return True
         except RateLimitError as e:
             consec_errors += 1
@@ -853,8 +941,6 @@ def main():
                 elif i == 3:
                     bl_mode = (bl_mode + 1) % 3
                 if is_detail_view():
-                    alert_idx = 0
-                    last_alert_tick_ms = now
                     if comp_last_ms is None or time.ticks_diff(now, comp_last_ms) >= comp_fresh_ms:
                         comp_poll_pending = True
                 else:
@@ -862,19 +948,6 @@ def main():
                 dirty = True
         prev_btn = cur_btn
         update_backlight(now)
-
-        # Rotate alert ticker every ALERT_TICK_MS on Battery/Grid detail views
-        if (
-            not dirty
-            and bl_mode != BL_OFF
-            and view_mode in (VIEW_BATT_DETAIL, VIEW_GRID_DETAIL)
-            and comp_data is not None
-            and len(comp_data["alerts"]) > 1
-            and time.ticks_diff(now, last_alert_tick_ms) >= ALERT_TICK_MS
-        ):
-            alert_idx = (alert_idx + 1) % len(comp_data["alerts"])
-            last_alert_tick_ms = now
-            dirty = True
 
         if dirty:
             draw_ui()
@@ -913,6 +986,8 @@ def main():
                     latest["load_w"] = data["load_w"]
                     latest["site_w"] = data["site_w"]
                     latest["grid_ok"] = data["grid_ok"]
+                    latest["site_shutdown"] = data["site_shutdown"]
+                    latest["exp_lim_w"] = data["exp_lim_w"]
                     if data["time_str"]:
                         latest["time_str"] = data["time_str"]
 
@@ -924,11 +999,12 @@ def main():
                     status_is_err = False
                     delay_ms = config.POLL_INTERVAL_S * 1000
                     print(
-                        "SOC={:.1f}% REM={:.2f}kWh BATT={}W SOLAR={}W FREE={}B".format(
+                        "SOC={:.1f}% REM={:.2f}kWh BATT={}W SOLAR={}W EXPLIM={}W FREE={}B".format(
                             latest["soc_pct"],
                             latest["remaining_wh"] / 1000.0,
                             latest["batt_w"],
                             latest["solar_w"],
+                            latest["exp_lim_w"],
                             gc.mem_free(),
                         )
                     )
