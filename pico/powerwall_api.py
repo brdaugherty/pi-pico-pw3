@@ -175,6 +175,33 @@ def _parse_date_hhmm(date_hdr, utc_offset_hours=0):
     return None
 
 
+def _parse_iso_hhmm(iso_str, utc_offset_hours=0):
+    """
+    Extract HH:MM from Powerwall system.time ISO-8601 string, e.g.
+    '2026-11-23T08:44:27-08:00' (already site-local with DST).
+    Only applies utc_offset_hours if the timestamp explicitly ends with 'Z'.
+    """
+    if not iso_str:
+        return None
+    t_idx = iso_str.find("T")
+    if t_idx < 0:
+        t_idx = iso_str.find(" ")
+    if t_idx < 0 or len(iso_str) < t_idx + 6:
+        return None
+    if iso_str[t_idx + 3] != ":":
+        return None
+    try:
+        hh = int(iso_str[t_idx + 1:t_idx + 3])
+        mm = int(iso_str[t_idx + 4:t_idx + 6])
+        if iso_str.endswith("Z"):
+            hh = (hh + int(utc_offset_hours)) % 24
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return "{:02d}:{:02d}".format(hh, mm)
+    except ValueError:
+        return None
+    return None
+
+
 class _ChunkedReader:
     """Minimal HTTP/1.1 Transfer-Encoding: chunked reader."""
 
@@ -327,6 +354,13 @@ def _scan_stream_for_metrics(reader, metrics, chunk_size=1024, wdt_feed=None):
             b = _extract_bool_after(window, b'"gridOK"')
             if b is not None:
                 metrics["grid_ok"] = b
+
+        if metrics.get("sys_time") is None:
+            spos = window.find(b'"system"')
+            if spos >= 0:
+                ts = _extract_string_after(window, b'"time"', spos)
+                if ts:
+                    metrics["sys_time"] = ts
 
         for loc_tok, mkey in meter_keys:
             if metrics[mkey] is None:
@@ -774,6 +808,7 @@ class Powerwall3Client:
             "load_w": None,
             "site_w": None,
             "grid_ok": None,
+            "sys_time": None,
             "time_str": None,
         }
         resp_hdrs, _ = self._https_request(
@@ -796,8 +831,9 @@ class Powerwall3Client:
         raw_soc = (rem / full) * 100.0
         metrics["soc_raw"] = raw_soc
         metrics["soc_pct"] = scale_soc_to_app(raw_soc) if self.soc_scale_to_app else raw_soc
-        metrics["time_str"] = _parse_date_hhmm(
-            resp_hdrs.get("date"), self.utc_offset_hours
+        metrics["time_str"] = (
+            _parse_iso_hhmm(metrics["sys_time"], self.utc_offset_hours)
+            or _parse_date_hhmm(resp_hdrs.get("date"), self.utc_offset_hours)
         )
         return metrics
 

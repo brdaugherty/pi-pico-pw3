@@ -238,8 +238,10 @@ def make_handler(expected_pwd, din, force_gzip=False):
                     payload_json = json.dumps(simulated_components(st))
                 else:
                     # Include realistic esCan padding (~12 KB uncompressed) to test RP2040 streaming
+                    local_iso = time.strftime("%Y-%m-%dT%H:%M:%S-08:00", time.localtime())
                     payload_json = json.dumps(
                         {
+                            "system": {"time": local_iso},
                             "esCan": {"bus": {"PINV": [{"isMIA": True, "PINV_Vout": 0}] * 300}},
                             "control": {
                                 "islanding": {"contactorClosed": True, "gridOK": True},

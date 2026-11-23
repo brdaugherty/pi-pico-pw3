@@ -789,7 +789,7 @@ def main():
             else:
                 alert_idx = 0
             last_alert_tick_ms = comp_last_ms
-            if c.get("time_str"):
+            if c.get("time_str") and latest["time_str"] == "--:--":
                 latest["time_str"] = c["time_str"]
             status_msg = "OK (VITALS)"
             status_is_err = False
