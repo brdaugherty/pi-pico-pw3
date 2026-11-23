@@ -175,6 +175,8 @@ def simulated_components(st):
                     "signals": [
                         _sig("BMS_nominalEnergyRemaining", round(st["rem_wh"] / 1000.0, 3)),
                         _sig("BMS_nominalFullPackEnergy", round(st["full_wh"] / 1000.0, 3)),
+                        _sig("BMS_LOG_tempOutOfBounds", 0),
+                        _sig("BMS_LOG_tempOutOfBoundsCharge", 0),
                     ],
                     "activeAlerts": [],
                 }
@@ -238,11 +240,14 @@ def make_handler(expected_pwd, din, force_gzip=False):
                     payload_json = json.dumps(simulated_components(st))
                 else:
                     # Include realistic esCan padding (~12 KB uncompressed) to test RP2040 streaming
+                    local_iso = time.strftime("%Y-%m-%dT%H:%M:%S-08:00", time.localtime())
                     payload_json = json.dumps(
                         {
+                            "system": {"time": local_iso},
                             "esCan": {"bus": {"PINV": [{"isMIA": True, "PINV_Vout": 0}] * 300}},
                             "control": {
                                 "islanding": {"contactorClosed": True, "gridOK": True},
+                                "siteShutdown": {"isShutDown": False, "reasons": []},
                                 "meterAggregates": [
                                     {"location": "BATTERY", "realPowerW": st["batt_w"]},
                                     {"location": "SITE", "realPowerW": st["site_w"]},
@@ -253,6 +258,12 @@ def make_handler(expected_pwd, din, force_gzip=False):
                                     "nominalEnergyRemainingWh": st["rem_wh"],
                                     "nominalFullPackEnergyWh": st["full_wh"],
                                 },
+                            },
+                            "ieee20305": {
+                                "controls": {
+                                    "defaultControl": {"opModExpLimW": 5000},
+                                    "activeControls": {"opModExpLimW": 4500},
+                                }
                             },
                         }
                     )

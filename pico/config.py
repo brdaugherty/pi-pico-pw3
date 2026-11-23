@@ -21,10 +21,12 @@ SOCKET_TIMEOUT_S = 12            # RP2040 software TLS + PW3 response needs 8-12
 RATE_LIMIT_COOLDOWN_S = 300      # 5-minute cooldown if gateway returns HTTP 429/503
 SOC_SCALE_TO_APP = True          # True = Tesla App SoC ((raw - 5) / 0.95); False = raw physical SoC
 DEFAULT_CAPACITY_WH = 13500      # Fallback until first nominalFullPackEnergyWh reading (auto-scales)
-HISTORY_SAMPLES = 120            # In-RAM ring buffer (120 * 30s = 60 min; 480 bytes RAM; no flash writes)
+HISTORY_HOURS = 24               # Trend chart span in hours (e.g. 12 or 24; RAM-only, no flash writes)
+HISTORY_STEP_S = 300             # Chart bucket interval in seconds (300s = 5 min -> 288 pts for 24h = 1.1 KB RAM)
+EXPORT_LIMIT_W = 0               # Optional fallback grid-export cap in W if utility doesn't send ieee20305 (0 = auto only)
 
-# --- Clock Display (synced offline from Powerwall HTTP Date header) ---
-UTC_OFFSET_HOURS = 0             # Local offset from UTC (e.g., -8 for PST, -5 for EST, 1 for CET)
+# --- Clock Display (uses PW3 local system.time + auto DST; fallback to HTTP Date) ---
+UTC_OFFSET_HOURS = 0             # Fallback offset if system.time is absent (e.g., -8 PST)
 
 # --- Always-On Low-Power & Display Pack 2.8" Settings ---
 WIFI_POWERSAVE = False           # Keep False for PW3 AP stability (CYW43 PM_POWERSAVE can drop packets)
