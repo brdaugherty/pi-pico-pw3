@@ -71,7 +71,7 @@ _bk_go = 0.0
 
 VIEW_SOC, VIEW_GRID, VIEW_FLOW = 0, 1, 2
 VIEW_BATT_DETAIL, VIEW_GRID_DETAIL, VIEW_STRINGS_DETAIL = 3, 4, 5
-view_mode = VIEW_SOC
+view_mode = VIEW_FLOW
 
 BL_AUTO, BL_BRIGHT, BL_OFF = 0, 1, 2
 bl_mode = BL_AUTO
@@ -362,7 +362,8 @@ def draw_chart(is_soc):
 
 def draw_power_flow():
     soc = latest["soc_pct"]
-    draw_header("Live Power Flow", "{:.1f}%".format(soc) if soc is not None else "--.-%", C_GREEN if (soc or 0) >= 20 else C_RED)
+    scol = C_MUTED if soc is None else (C_GREEN if soc >= 20 else C_RED)
+    draw_header("Live Power Flow", "{:.1f}%".format(soc) if soc is not None else "--.-%", scol)
     rem_k = (latest["remaining_wh"] / 1000.0) if latest["remaining_wh"] is not None else 0.0
     full_k = (latest["full_wh"] / 1000.0) if latest["full_wh"] else 13.5
 
@@ -390,7 +391,8 @@ def draw_power_flow():
         display.set_pen(C_TEXT)
         display.text(fmt_kw(watts), cx + 10, cy + 22, scale=2)
 
-    gstr = "GRID: OK" if latest["grid_ok"] is not False else "GRID: ISLAND"
+    gok = latest["grid_ok"]
+    gstr = "GRID: --" if gok is None else ("GRID: OK" if gok else "GRID: ISLAND")
     display.set_pen(C_MUTED)
     display.text("{}   RAM: {}KB free".format(gstr, gc.mem_free() // 1024), 10, 204, scale=1)
 
@@ -627,14 +629,17 @@ _WIFI_ERRS = {-1: "WIFI FAIL (-1)", -2: "NO AP (-2)", -3: "BAD PWD (-3)", 0: "WI
 _wifi_tried = False
 
 
-def init_wifi():
+def init_wifi(wdt_feed=None):
     try:
         network.country(config.WIFI_COUNTRY)
     except Exception:
         pass
     w = network.WLAN(network.STA_IF)
-    w.active(True)
-    time.sleep_ms(300)
+    if not w.active():
+        w.active(True)
+        time.sleep_ms(300)
+        if wdt_feed:
+            wdt_feed()
     try:
         w.config(pm=getattr(network.WLAN, "PM_NONE", 0xA11140))
     except Exception:
@@ -642,7 +647,7 @@ def init_wifi():
     return w
 
 
-def ensure_wifi(wlan, wdt_feed):
+def ensure_wifi(wlan, wdt_feed, btn_cb=None):
     global status_msg, status_is_err, _wifi_tried
     if wlan.isconnected():
         return True
@@ -665,6 +670,8 @@ def ensure_wifi(wlan, wdt_feed):
     while True:
         if wdt_feed:
             wdt_feed()
+        if btn_cb:
+            btn_cb(time.ticks_ms())
         st = wlan.status()
         if st == 3 or wlan.isconnected():
             break
@@ -676,7 +683,7 @@ def ensure_wifi(wlan, wdt_feed):
             status_msg = "TIMEOUT " + _WIFI_ERRS.get(st, "({})".format(st))
             print("WiFi timed out:", status_msg)
             return False
-        time.sleep_ms(250)
+        time.sleep_ms(100)
     if config.WIFI_POWERSAVE:
         try:
             wlan.config(pm=getattr(network.WLAN, "PM_POWERSAVE", 0x000011))
@@ -692,6 +699,7 @@ def main():
     global view_mode, bl_mode, last_input_ms, status_msg, status_is_err, consec_errors
     global comp_data, comp_last_ms, comp_poll_pending, cooldown_until_ms
 
+    print("Booting PW3 dashboard...")
     set_backlight(config.BACKLIGHT_ACTIVE)
     draw_ui()
     if config.ENABLE_WDT:
@@ -700,26 +708,63 @@ def main():
     else:
         wdt_feed = None
 
-    wlan = init_wifi()
-    client = Powerwall3Client(
-        host=config.PW_HOST, port=config.PW_PORT, gw_password=config.GW_PASSWORD,
-        timeout_s=config.SOCKET_TIMEOUT_S, soc_scale_to_app=config.SOC_SCALE_TO_APP,
-        utc_offset_hours=config.UTC_OFFSET_HOURS,
-        payload_file=getattr(tedapi_query, "PAYLOAD_FILE", ""),
-        graphql_payload=getattr(tedapi_query, "GRAPHQL_PAYLOAD", b""),
-        query_text=tedapi_query.QUERY_TEXT, query_sig=tedapi_query.QUERY_SIG,
-        query_vars=tedapi_query.QUERY_VARS, is_real_signed_query=tedapi_query.IS_REAL_SIGNED_QUERY,
-        components_payload=getattr(tedapi_query, "COMPONENTS_PAYLOAD", b""),
-        components_query_text=getattr(tedapi_query, "COMPONENTS_QUERY_TEXT", b""),
-        components_query_sig=getattr(tedapi_query, "COMPONENTS_QUERY_SIG", b""),
-        components_query_vars=getattr(tedapi_query, "COMPONENTS_QUERY_VARS", b"{}"),
-    )
+    try:
+        print("Init WiFi...")
+        wlan = init_wifi(wdt_feed)
+        sock_tmo = min(config.SOCKET_TIMEOUT_S, 7) if config.ENABLE_WDT else config.SOCKET_TIMEOUT_S
+        client = Powerwall3Client(
+            host=config.PW_HOST, port=config.PW_PORT, gw_password=config.GW_PASSWORD,
+            timeout_s=sock_tmo, soc_scale_to_app=config.SOC_SCALE_TO_APP,
+            utc_offset_hours=config.UTC_OFFSET_HOURS,
+            payload_file=getattr(tedapi_query, "PAYLOAD_FILE", ""),
+            graphql_payload=getattr(tedapi_query, "GRAPHQL_PAYLOAD", b""),
+            query_text=tedapi_query.QUERY_TEXT, query_sig=tedapi_query.QUERY_SIG,
+            query_vars=tedapi_query.QUERY_VARS, is_real_signed_query=tedapi_query.IS_REAL_SIGNED_QUERY,
+            components_payload=getattr(tedapi_query, "COMPONENTS_PAYLOAD", b""),
+            components_query_text=getattr(tedapi_query, "COMPONENTS_QUERY_TEXT", b""),
+            components_query_sig=getattr(tedapi_query, "COMPONENTS_QUERY_SIG", b""),
+            components_query_vars=getattr(tedapi_query, "COMPONENTS_QUERY_VARS", b"{}"),
+        )
+    except Exception as e:
+        status_msg, status_is_err = "BOOT: " + str(e)[:16], True
+        print("Boot error:", e)
+        draw_ui()
+        raise
     gc.collect()
     print("Boot complete. Free RAM:", gc.mem_free(), "bytes")
 
     prev_btn = [1, 1, 1, 1]
     next_poll_ms = time.ticks_ms()
     comp_fresh_ms = min(15, config.POLL_INTERVAL_S) * 1000
+
+    def _poll_buttons(now):
+        global view_mode, bl_mode, last_input_ms, comp_poll_pending
+        cur_btn = [btn_a.value(), btn_b.value(), btn_x.value(), btn_y.value()]
+        dirty = False
+        for i in range(4):
+            if prev_btn[i] == 1 and cur_btn[i] == 0:
+                last_input_ms = now
+                if bl_mode == BL_OFF and i != 3:
+                    bl_mode = BL_AUTO
+                elif i == 0:
+                    view_mode = VIEW_BATT_DETAIL if view_mode == VIEW_SOC else VIEW_SOC
+                elif i == 1:
+                    view_mode = VIEW_GRID_DETAIL if view_mode == VIEW_GRID else VIEW_GRID
+                elif i == 2:
+                    view_mode = VIEW_STRINGS_DETAIL if view_mode == VIEW_FLOW else VIEW_FLOW
+                elif i == 3:
+                    bl_mode = (bl_mode + 1) % 3
+                if is_detail_view():
+                    if comp_last_ms is None or time.ticks_diff(now, comp_last_ms) >= comp_fresh_ms:
+                        comp_poll_pending = True
+                else:
+                    comp_poll_pending = False
+                dirty = True
+        for i in range(4):
+            prev_btn[i] = cur_btn[i]
+        update_backlight(now)
+        if dirty:
+            draw_ui()
 
     def _run_vitals():
         global comp_data, comp_last_ms, comp_poll_pending, cooldown_until_ms
@@ -762,35 +807,11 @@ def main():
         if wdt_feed:
             wdt_feed()
         now = time.ticks_ms()
-        cur_btn = [btn_a.value(), btn_b.value(), btn_x.value(), btn_y.value()]
-        dirty = False
-        for i in range(4):
-            if prev_btn[i] == 1 and cur_btn[i] == 0:
-                last_input_ms = now
-                if bl_mode == BL_OFF and i != 3:
-                    bl_mode = BL_AUTO
-                elif i == 0:
-                    view_mode = VIEW_BATT_DETAIL if view_mode == VIEW_SOC else VIEW_SOC
-                elif i == 1:
-                    view_mode = VIEW_GRID_DETAIL if view_mode == VIEW_GRID else VIEW_GRID
-                elif i == 2:
-                    view_mode = VIEW_STRINGS_DETAIL if view_mode == VIEW_FLOW else VIEW_FLOW
-                elif i == 3:
-                    bl_mode = (bl_mode + 1) % 3
-                if is_detail_view():
-                    if comp_last_ms is None or time.ticks_diff(now, comp_last_ms) >= comp_fresh_ms:
-                        comp_poll_pending = True
-                else:
-                    comp_poll_pending = False
-                dirty = True
-        prev_btn = cur_btn
-        update_backlight(now)
-        if dirty:
-            draw_ui()
+        _poll_buttons(now)
 
         in_cd = cooldown_until_ms is not None and time.ticks_diff(cooldown_until_ms, now) > 0
         if comp_poll_pending and is_detail_view() and not in_cd:
-            if ensure_wifi(wlan, wdt_feed):
+            if ensure_wifi(wlan, wdt_feed, _poll_buttons):
                 status_msg, status_is_err = "POLLING VITALS...", False
                 draw_ui()
                 _run_vitals()
@@ -802,7 +823,10 @@ def main():
             draw_ui()
 
         if time.ticks_diff(now, next_poll_ms) >= 0:
-            if ensure_wifi(wlan, wdt_feed):
+            if ensure_wifi(wlan, wdt_feed, _poll_buttons):
+                if status_msg == "BOOTING PW3..." or status_msg.startswith("WIFI "):
+                    status_msg, status_is_err = "POLLING PW3...", False
+                    draw_ui()
                 try:
                     gc.collect()
                     d = client.poll(wdt_feed=wdt_feed)
