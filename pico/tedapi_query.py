@@ -10,6 +10,7 @@
 
 IS_REAL_SIGNED_QUERY = False
 GRAPHQL_PAYLOAD = b""
+COMPONENTS_PAYLOAD = b""
 
 QUERY_TEXT = (
     b"query DeviceControllerQuery {\n"
@@ -32,3 +33,16 @@ QUERY_TEXT = (
 
 QUERY_SIG = b"MOCK_ECDSA_SIGNATURE_REPLACE_VIA_EXPORT_SCRIPT"
 QUERY_VARS = b"{}"
+
+COMPONENTS_QUERY_TEXT = (
+    b"query ComponentsQuery {\n"
+    b"  components {\n"
+    b"    pch { signals { name value textValue } activeAlerts { name } }\n"
+    b"    hvp { signals { name value textValue } activeAlerts { name } }\n"
+    b"    pws { signals { name value textValue } activeAlerts { name } }\n"
+    b"    baggr { signals { name value textValue } activeAlerts { name } }\n"
+    b"  }\n"
+    b"}\n"
+)
+COMPONENTS_QUERY_SIG = b"MOCK_COMPONENTS_ECDSA_SIGNATURE_REPLACE_VIA_EXPORT_SCRIPT"
+COMPONENTS_QUERY_VARS = b"{}"

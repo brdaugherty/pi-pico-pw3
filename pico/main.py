@@ -3,11 +3,13 @@
 # running Pimoroni MicroPython v1.25.0 + Pimoroni Pico Display Pack 2.8" (320x240).
 #
 # Zero flash writes: 120-sample trend history is held in fixed-size RAM arrays (480 bytes).
-# Buttons:
-#   A (GP12) : State of Charge (%) trend graph
-#   B (GP13) : Stored Energy (kWh) trend graph
-#   X (GP14) : Live Power Flow overview (Solar / Home / Battery / Grid)
+# Buttons (press A/B/X again to toggle between Primary and Detail views):
+#   A (GP12) : State of Charge (%) trend  <->  Battery & Thermal vitals
+#   B (GP13) : Stored Energy (kWh) trend  <->  Grid, AC Inverter & Safety vitals
+#   X (GP14) : Live Power Flow aggregate  <->  Solar Strings A-F breakdown
 #   Y (GP15) : Cycle backlight (Auto-Dim -> Bright -> Screen Off)
+#
+# ComponentsQuery (strings & vitals) is polled ONLY while on a detail view.
 
 import array
 import gc
@@ -63,6 +65,9 @@ hist_head = 0
 VIEW_SOC = 0
 VIEW_KWH = 1
 VIEW_FLOW = 2
+VIEW_BATT_DETAIL = 3
+VIEW_GRID_DETAIL = 4
+VIEW_STRINGS_DETAIL = 5
 view_mode = VIEW_SOC
 
 BL_AUTO = 0
@@ -83,9 +88,18 @@ latest = {
     "grid_ok": None,
     "time_str": "--:--",
 }
+comp_data = None
+comp_last_ms = None
+comp_poll_pending = False
+cooldown_until_ms = None
+
 status_msg = "BOOTING PW3..."
 status_is_err = False
 consec_errors = 0
+
+
+def is_detail_view():
+    return view_mode in (VIEW_BATT_DETAIL, VIEW_GRID_DETAIL, VIEW_STRINGS_DETAIL)
 
 
 def set_backlight(level):
@@ -170,7 +184,10 @@ def draw_footer():
     display.set_pen(C_RED if status_is_err else C_MUTED)
     display.text(status_msg[:22], 20, HEIGHT - 15, scale=1)
 
-    right_info = "{}  A:SOC B:kWh X:PWR".format(latest["time_str"] or "--:--")
+    lbl_a = "A:BAT" if view_mode == VIEW_SOC else "A:SOC"
+    lbl_b = "B:GRD" if view_mode == VIEW_KWH else "B:kWh"
+    lbl_x = "X:STR" if view_mode == VIEW_FLOW else "X:PWR"
+    right_info = "{}  {} {} {}".format(latest["time_str"] or "--:--", lbl_a, lbl_b, lbl_x)
     display.set_pen(C_MUTED)
     draw_text_right(right_info, WIDTH - 6, HEIGHT - 15, scale=1)
 
@@ -291,6 +308,261 @@ def draw_power_flow():
     display.text("{}   RAM: {}KB free".format(grid_str, free_kb), 10, 204, scale=1)
 
 
+def _short_state(val, max_len=14):
+    if not val:
+        return "--"
+    s = str(val)
+    for prefix in (
+        "PCH_AcMode_",
+        "PCH_State_",
+        "HVP_State_",
+        "BAGGR_State_",
+        "PWS_RSD_",
+        "PWS_ProdSwitch_",
+        "PWS_SelfTest_",
+        "Pv_",
+    ):
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+            break
+    return s[:max_len]
+
+
+def _draw_detail_card(cx, cy, cw, ch, col, title, main_str, sub_str):
+    display.set_pen(C_PANEL)
+    display.rectangle(cx, cy, cw, ch)
+    display.set_pen(col)
+    display.rectangle(cx, cy, 4, ch)
+    display.text(title, cx + 10, cy + 5, scale=1)
+    display.set_pen(C_TEXT)
+    display.text(main_str[:11], cx + 10, cy + 18, scale=2)
+    display.set_pen(C_MUTED)
+    display.text(sub_str[:21], cx + 10, cy + 42, scale=1)
+
+
+def _draw_alerts_bar(alerts, extra_right=""):
+    bx, by, bw, bh = 10, 184, WIDTH - 20, 28
+    display.set_pen(C_PANEL)
+    display.rectangle(bx, by, bw, bh)
+    if alerts:
+        display.set_pen(C_RED)
+        display.rectangle(bx, by, 4, bh)
+        msg = "ALERTS ({}): {}".format(len(alerts), alerts[0])
+        display.text(msg[:46], bx + 10, by + 10, scale=1)
+    else:
+        display.set_pen(C_GREEN)
+        display.rectangle(bx, by, 4, bh)
+        display.set_pen(C_MUTED)
+        display.text("ALERTS: NONE", bx + 10, by + 10, scale=1)
+        if extra_right:
+            draw_text_right(extra_right[:26], bx + bw - 8, by + 10, scale=1)
+
+
+def draw_batt_detail():
+    c = comp_data
+    tmax = c["pack_temp_max"] if c else None
+    big = "{:.1f}C".format(tmax) if tmax is not None else "--.-C"
+    if tmax is None:
+        hdr_col = C_CYAN
+    elif tmax >= 50.0:
+        hdr_col = C_RED
+    elif tmax >= 40.0:
+        hdr_col = C_AMBER
+    else:
+        hdr_col = C_GREEN
+    draw_header("Battery & Thermal", big, hdr_col)
+
+    if c is None:
+        display.set_pen(C_MUTED)
+        display.text("Polling PW3 vitals...", 92, 125, scale=1)
+        return
+
+    tmin = c["pack_temp_min"]
+    shunt = c["shunt_temp"]
+    temp_main = "{:.1f} C".format(tmax) if tmax is not None else "--.- C"
+    tmin_s = "{:.1f}".format(tmin) if tmin is not None else "--"
+    shunt_s = "{:.1f}".format(shunt) if shunt is not None else "--"
+    _draw_detail_card(
+        10, 54, 145, 58, C_CYAN, "PACK TEMP MAX", temp_main,
+        "MIN {}C  SH {}C".format(tmin_s, shunt_s),
+    )
+
+    amb = c["inv_ambient_temp"]
+    amb_main = "{:.1f} C".format(amb) if amb is not None else "--.- C"
+    _draw_detail_card(
+        165, 54, 145, 58, C_AMBER, "INV AMBIENT", amb_main,
+        "HVP: " + _short_state(c["hvp_state"], 15),
+    )
+
+    fa = c["fan_rpm_a"]
+    fb = c["fan_rpm_b"]
+    da = c["fan_duty_a"]
+    db = c["fan_duty_b"]
+    if fa is not None and fb is not None:
+        fan_main = "{} RPM".format(int((fa + fb) * 0.5 + 0.5))
+    elif fa is not None:
+        fan_main = "{} RPM".format(int(fa + 0.5))
+    else:
+        fan_main = "-- RPM"
+    fa_s = str(int(fa + 0.5)) if fa is not None else "--"
+    fb_s = str(int(fb + 0.5)) if fb is not None else "--"
+    da_s = "{}%".format(int(da + 0.5)) if da is not None else "--"
+    db_s = "{}%".format(int(db + 0.5)) if db is not None else "--"
+    _draw_detail_card(
+        10, 118, 145, 58, C_BLUE, "COOLING FANS", fan_main,
+        "A:{}({}) B:{}({})".format(fa_s, da_s, fb_s, db_s),
+    )
+
+    bc = c["batt_connected"]
+    be = c["batt_expected"]
+    if bc is not None and be is not None:
+        pack_main = "{} / {} OK".format(int(bc), int(be))
+        pack_col = C_GREEN if int(bc) == int(be) else C_RED
+    elif bc is not None:
+        pack_main = "{} CONN".format(int(bc))
+        pack_col = C_GREEN
+    else:
+        pack_main = "-- PACKS"
+        pack_col = C_MUTED
+    _draw_detail_card(
+        165, 118, 145, 58, pack_col, "PACKS / BAGGR", pack_main,
+        "ST: " + _short_state(c["baggr_state"], 16),
+    )
+
+    free_kb = gc.mem_free() // 1024
+    _draw_alerts_bar(c["alerts"], "RAM: {}KB free".format(free_kb))
+
+
+def draw_grid_detail():
+    c = comp_data
+    vab = c["ac_v_ab"] if c else None
+    big = "{:.1f}V".format(vab) if vab is not None else "--.-V"
+    hdr_col = C_GREEN if latest["grid_ok"] is not False else C_RED
+    draw_header("Grid & AC Vitals", big, hdr_col)
+
+    if c is None:
+        display.set_pen(C_MUTED)
+        display.text("Polling PW3 vitals...", 92, 125, scale=1)
+        return
+
+    van = c["ac_v_an"]
+    vbn = c["ac_v_bn"]
+    v_main = "{:.1f} V".format(vab) if vab is not None else "--.- V"
+    l1_s = "{:.1f}".format(van) if van is not None else "--"
+    l2_s = "{:.1f}".format(vbn) if vbn is not None else "--"
+    _draw_detail_card(
+        10, 54, 145, 58, C_CYAN, "AC SPLIT-PHASE", v_main,
+        "L1:{}V  L2:{}V".format(l1_s, l2_s),
+    )
+
+    freq = c["ac_freq"]
+    f_main = "{:.2f}Hz".format(freq) if freq is not None else "--.--Hz"
+    f_col = C_GREEN if (freq is not None and 59.5 <= freq <= 60.5) else C_AMBER
+    grid_sub = "GRID: OK" if latest["grid_ok"] is not False else "GRID: ISLAND"
+    _draw_detail_card(165, 54, 145, 58, f_col, "FREQUENCY", f_main, grid_sub)
+
+    ac_w = c["ac_power_w"] if c["ac_power_w"] is not None else c["pch_batt_w"]
+    _draw_detail_card(
+        10, 118, 145, 58, C_MAGENTA, "INVERTER AC", fmt_kw(ac_w),
+        "MODE: " + _short_state(c["ac_mode"], 14),
+    )
+
+    rsd = _short_state(c["rsd_state"], 10)
+    sw = _short_state(c["prod_switch"], 8)
+    pch_st = _short_state(c["pch_state"], 8)
+    _draw_detail_card(
+        165, 118, 145, 58, C_AMBER, "SAFETY / RSD", rsd,
+        "SW:{} P:{}".format(sw, pch_st),
+    )
+
+    _draw_alerts_bar(c["alerts"], "TEST: " + _short_state(c["self_test"], 16))
+
+
+def draw_strings_detail():
+    c = comp_data
+    dc_sum = c["strings_dc_w"] if c else None
+    ac_solar = latest["solar_w"]
+    hdr_w = dc_sum if (dc_sum is not None and dc_sum > 0.0) else ac_solar
+    big = "{:.2f}kW".format(hdr_w / 1000.0) if hdr_w is not None else "--.-kW"
+    draw_header("Solar Strings", big, C_AMBER)
+
+    if c is None:
+        display.set_pen(C_MUTED)
+        display.text("Polling PW3 strings...", 88, 125, scale=1)
+        return
+
+    # Sub-summary: DC sum of strings A-F vs AC aggregate SOLAR power
+    dc_kw = dc_sum / 1000.0
+    if ac_solar is not None:
+        if dc_sum >= 100.0 and ac_solar >= 0.0:
+            eff = int(min(100.0, (ac_solar / dc_sum) * 100.0) + 0.5)
+            summary = "DC:{:.2f}kW  AC:{:.2f}kW  EFF:{}%".format(
+                dc_kw, ac_solar / 1000.0, eff
+            )
+        else:
+            summary = "DC SUM:{:.2f}kW   AC SOLAR:{:.2f}kW".format(
+                dc_kw, ac_solar / 1000.0
+            )
+    else:
+        summary = "DC SUM:{:.2f}kW".format(dc_kw)
+    display.set_pen(C_MUTED)
+    display.text(summary, 10, 50, scale=1)
+
+    bar_x = 32
+    bar_w = 132
+    for idx, srec in enumerate(c["strings"]):
+        ry = 64 + idx * 25
+        sw = srec["w"] or 0.0
+        sv = srec["v"]
+        si = srec["i"]
+        st = srec["state"] or ""
+        is_active = ("Active" in st) or sw >= 5.0
+
+        display.set_pen(C_PANEL)
+        display.rectangle(8, ry, WIDTH - 16, 22)
+
+        # String letter badge A..F
+        if sw >= 10.0:
+            lbl_col = C_AMBER
+        elif is_active:
+            lbl_col = C_CYAN
+        else:
+            lbl_col = C_MUTED
+        display.set_pen(lbl_col)
+        display.text(srec["id"], 13, ry + 4, scale=2)
+
+        # Proportional share bar
+        display.set_pen(C_GRID)
+        display.rectangle(bar_x, ry + 3, bar_w, 8)
+        if dc_sum > 1.0 and sw > 0.0:
+            frac = sw / dc_sum
+            if frac > 1.0:
+                frac = 1.0
+            fill_w = int(frac * bar_w)
+            if fill_w > 0:
+                display.set_pen(C_AMBER)
+                display.rectangle(bar_x, ry + 3, fill_w, 8)
+            pct = int(frac * 100.0 + 0.5)
+        else:
+            pct = 0
+
+        # Compact electrical info below bar (V / A or state)
+        display.set_pen(C_MUTED)
+        if is_active and (sv is not None or si is not None):
+            va_str = "{:.0f}V  {:.1f}A".format(sv or 0.0, si or 0.0)
+        elif st:
+            va_str = _short_state(st, 16)
+        else:
+            va_str = "--"
+        display.text(va_str, bar_x, ry + 13, scale=1)
+
+        # Right-aligned power (kW) + % share of total solar
+        display.set_pen(C_TEXT if sw >= 10.0 else C_MUTED)
+        draw_text_right("{:.2f}kW".format(sw / 1000.0), 274, ry + 4, scale=2)
+        display.set_pen(C_AMBER if pct > 0 else C_MUTED)
+        draw_text_right("{:2d}%".format(pct), WIDTH - 12, ry + 8, scale=1)
+
+
 def draw_ui():
     display.set_pen(C_BG)
     display.clear()
@@ -298,8 +570,14 @@ def draw_ui():
         draw_chart(True)
     elif view_mode == VIEW_KWH:
         draw_chart(False)
-    else:
+    elif view_mode == VIEW_FLOW:
         draw_power_flow()
+    elif view_mode == VIEW_BATT_DETAIL:
+        draw_batt_detail()
+    elif view_mode == VIEW_GRID_DETAIL:
+        draw_grid_detail()
+    else:
+        draw_strings_detail()
     draw_footer()
     display.update()
 
@@ -417,6 +695,7 @@ def ensure_wifi(wlan, wdt_feed):
 
 def main():
     global view_mode, bl_mode, last_input_ms, status_msg, status_is_err, consec_errors
+    global comp_data, comp_last_ms, comp_poll_pending, cooldown_until_ms
 
     set_backlight(config.BACKLIGHT_ACTIVE)
     draw_ui()
@@ -442,6 +721,10 @@ def main():
         query_sig=tedapi_query.QUERY_SIG,
         query_vars=tedapi_query.QUERY_VARS,
         is_real_signed_query=tedapi_query.IS_REAL_SIGNED_QUERY,
+        components_payload=getattr(tedapi_query, "COMPONENTS_PAYLOAD", b""),
+        components_query_text=getattr(tedapi_query, "COMPONENTS_QUERY_TEXT", b""),
+        components_query_sig=getattr(tedapi_query, "COMPONENTS_QUERY_SIG", b""),
+        components_query_vars=getattr(tedapi_query, "COMPONENTS_QUERY_VARS", b"{}"),
     )
 
     gc.collect()
@@ -449,13 +732,61 @@ def main():
 
     prev_btn = [1, 1, 1, 1]
     next_poll_ms = time.ticks_ms()
+    comp_fresh_ms = min(15, config.POLL_INTERVAL_S) * 1000
+
+    def _run_components_poll():
+        global comp_data, comp_last_ms, comp_poll_pending, cooldown_until_ms
+        global status_msg, status_is_err, consec_errors
+        try:
+            c = client.poll_components(wdt_feed=wdt_feed)
+            comp_data = c
+            comp_last_ms = time.ticks_ms()
+            comp_poll_pending = False
+            if c.get("time_str"):
+                latest["time_str"] = c["time_str"]
+            status_msg = "OK (VITALS)"
+            status_is_err = False
+            print(
+                "VITALS: DC={:.0f}W VAB={}V FREQ={}Hz TMAX={}C ALERTS={} FREE={}B".format(
+                    c["strings_dc_w"],
+                    c["ac_v_ab"],
+                    c["ac_freq"],
+                    c["pack_temp_max"],
+                    len(c["alerts"]),
+                    gc.mem_free(),
+                )
+            )
+            return True
+        except RateLimitError as e:
+            consec_errors += 1
+            comp_poll_pending = False
+            cooldown_until_ms = time.ticks_add(
+                time.ticks_ms(), config.RATE_LIMIT_COOLDOWN_S * 1000
+            )
+            status_msg = "429 COOLDOWN 5m"
+            status_is_err = True
+            print("Vitals rate limited:", e)
+            return False
+        except AuthError as e:
+            consec_errors += 1
+            comp_poll_pending = False
+            status_msg = "AUTH ERR: " + str(e)
+            status_is_err = True
+            print("Vitals auth error:", e)
+            return False
+        except Exception as e:
+            comp_poll_pending = False
+            status_msg = "VITALS: " + str(e)[:14]
+            status_is_err = True
+            print("Vitals poll error:", e)
+            return False
 
     while True:
         if wdt_feed:
             wdt_feed()
         now = time.ticks_ms()
 
-        # 1. Edge-triggered debounced button handling
+        # 1. Edge-triggered debounced button handling (press A/B/X again to toggle detail)
         cur_btn = [btn_a.value(), btn_b.value(), btn_x.value(), btn_y.value()]
         dirty = False
         for i in range(4):
@@ -464,13 +795,18 @@ def main():
                 if bl_mode == BL_OFF and i != 3:
                     bl_mode = BL_AUTO
                 elif i == 0:
-                    view_mode = VIEW_SOC
+                    view_mode = VIEW_BATT_DETAIL if view_mode == VIEW_SOC else VIEW_SOC
                 elif i == 1:
-                    view_mode = VIEW_KWH
+                    view_mode = VIEW_GRID_DETAIL if view_mode == VIEW_KWH else VIEW_KWH
                 elif i == 2:
-                    view_mode = VIEW_FLOW
+                    view_mode = VIEW_STRINGS_DETAIL if view_mode == VIEW_FLOW else VIEW_FLOW
                 elif i == 3:
                     bl_mode = (bl_mode + 1) % 3
+                if is_detail_view():
+                    if comp_last_ms is None or time.ticks_diff(now, comp_last_ms) >= comp_fresh_ms:
+                        comp_poll_pending = True
+                else:
+                    comp_poll_pending = False
                 dirty = True
         prev_btn = cur_btn
         update_backlight(now)
@@ -478,7 +814,28 @@ def main():
         if dirty:
             draw_ui()
 
-        # 2. Cooperative Powerwall 3 poll (never inside a Timer ISR)
+        in_cooldown = (
+            cooldown_until_ms is not None
+            and time.ticks_diff(cooldown_until_ms, now) > 0
+        )
+
+        # 2. Immediate on-demand ComponentsQuery poll when user toggles into a detail view
+        if comp_poll_pending and is_detail_view() and not in_cooldown:
+            if ensure_wifi(wlan, wdt_feed):
+                status_msg = "POLLING VITALS..."
+                status_is_err = False
+                draw_ui()
+                _run_components_poll()
+                if cooldown_until_ms is not None and time.ticks_diff(cooldown_until_ms, time.ticks_ms()) > 0:
+                    next_poll_ms = cooldown_until_ms
+                update_led()
+                draw_ui()
+            else:
+                comp_poll_pending = False
+                update_led()
+                draw_ui()
+
+        # 3. Cooperative Powerwall 3 poll (never inside a Timer ISR)
         if time.ticks_diff(now, next_poll_ms) >= 0:
             if ensure_wifi(wlan, wdt_feed):
                 try:
@@ -497,6 +854,7 @@ def main():
                     push_history(latest["soc_pct"], latest["remaining_wh"])
 
                     consec_errors = 0
+                    cooldown_until_ms = None
                     status_msg = "OK (TEDAPI)"
                     status_is_err = False
                     delay_ms = config.POLL_INTERVAL_S * 1000
@@ -509,11 +867,18 @@ def main():
                             gc.mem_free(),
                         )
                     )
+
+                    # Refresh ComponentsQuery ONLY while staying on a detail view
+                    if is_detail_view():
+                        _run_components_poll()
+                        if cooldown_until_ms is not None and time.ticks_diff(cooldown_until_ms, time.ticks_ms()) > 0:
+                            delay_ms = config.RATE_LIMIT_COOLDOWN_S * 1000
                 except RateLimitError as e:
                     consec_errors += 1
                     status_msg = "429 COOLDOWN 5m"
                     status_is_err = True
                     delay_ms = config.RATE_LIMIT_COOLDOWN_S * 1000
+                    cooldown_until_ms = time.ticks_add(time.ticks_ms(), delay_ms)
                     print("Rate limited:", e)
                 except AuthError as e:
                     consec_errors += 1

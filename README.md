@@ -5,11 +5,11 @@ Self-contained, zero-C-compilation MicroPython dashboard for **Tesla Powerwall 3
 ## Files
 
 - `pico/config.py` — Powerwall 3 AP credentials (`TeslaPW_XXXXXX`), poll interval, UTC offset, backlight, and watchdog toggle.
-- `pico/powerwall_api.py` — Lean Powerwall 3 TEDAPI HTTPS/1.1 + Protobuf client with two-phase gzip handling (closes TLS + `gc.collect()` before `deflate.DeflateIO` so mbedTLS 44 KB and GZIP 32 KB never overlap on RP2040) and O(1)-RAM streaming field extraction.
-- `pico/tedapi_query.py` — Signed TEDAPI GraphQL query + ECDSA-P521 signature (populated via `tools/export_tedapi_query.py`).
-- `pico/main.py` — Cooperative always-on dashboard: `PEN_P4` (38.4 KB framebuffer), 480-byte in-RAM ring buffers (120 samples, zero flash wear), debounced A/B/X/Y views, GP26–28 RGB LED, CYW43 `PM_POWERSAVE`, auto-dimming backlight, Wi-Fi auto-reconnect, and WDT with 2.5 s USB interrupt grace window.
-- `tools/export_tedapi_query.py` — One-time PC script to export the verified Tesla-signed query from `pypowerwall` into `pico/tedapi_query.py`.
-- `tools/mock_powerwall.py` — Self-signed TLS Powerwall 3 TEDAPI simulator (`--gzip` option included) for PC bench testing.
+- `pico/powerwall_api.py` — Lean Powerwall 3 TEDAPI HTTPS/1.1 + Protobuf client (`DeviceControllerQuery` + on-demand `ComponentsQuery`) with two-phase gzip handling (closes TLS + `gc.collect()` before `deflate.DeflateIO` so mbedTLS 44 KB and GZIP 32 KB never overlap on RP2040) and O(1)-RAM streaming field extraction.
+- `pico/tedapi_query.py` — Signed TEDAPI GraphQL payloads (`DeviceControllerQuery` + `ComponentsQuery`, populated via `tools/export_tedapi_query.py`).
+- `pico/main.py` — Cooperative always-on dashboard: `PEN_P4` (38.4 KB framebuffer), 480-byte in-RAM ring buffers (120 samples, zero flash wear), press-again-to-toggle A/B/X primary & detail views (`A`: SoC ↔ Battery/Thermal, `B`: kWh ↔ Grid/AC/Safety, `X`: Power Flow ↔ Solar Strings A–F, `Y`: Backlight), on-demand `ComponentsQuery` polling only on detail views, GP26–28 RGB LED, auto-dimming backlight, Wi-Fi auto-reconnect, and WDT with 2.5 s USB interrupt grace window.
+- `tools/export_tedapi_query.py` — One-time PC script to export the verified Tesla-signed `DeviceControllerQuery` and `ComponentsQuery` payloads from `pypowerwall` into `pico/tedapi_query.py`.
+- `tools/mock_powerwall.py` — Self-signed TLS Powerwall 3 TEDAPI simulator (both `DeviceControllerQuery` and `ComponentsQuery` with strings A–F, temps, fans, AC/grid vitals, plus `--gzip`) for PC bench testing.
 
 ## Quick Start (Already on Pimoroni `picow v1.25.0`)
 
