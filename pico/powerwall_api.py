@@ -62,11 +62,12 @@ def _pb_field_bytes(field_num, payload):
     return _pb_varint((field_num << 3) | 2) + _pb_varint(len(payload)) + payload
 
 
-def build_tedapi_query_request(
+def build_tedapi_query_parts(
     din, query_text=b"", query_sig=b"", variables_json=b"{}", graphql_payload=b""
 ):
     """
-    Build wire-exact TEDAPI Message / AuthEnvelope protobuf for POST /tedapi/v1:
+    Build wire-exact TEDAPI Message / AuthEnvelope protobuf parts for POST /tedapi/v1
+    without copying large graphql_payload / components_payload buffers on RP2040:
       1 (MessageEnvelope):
         1: 1                         (deliveryChannel = LOCAL_HTTPS)
         2: { 3: 1 }                  (sender.local = INSTALLER)
@@ -91,14 +92,31 @@ def build_tedapi_query_request(
 
     sender = _pb_field_varint(3, 1)
     recipient = _pb_field_bytes(1, din)
-    envelope = (
+    env_prefix = (
         _pb_field_varint(1, 1)
         + _pb_field_bytes(2, sender)
         + _pb_field_bytes(3, recipient)
-        + _pb_field_bytes(16, gql_msg)
+        + _pb_varint((16 << 3) | 2)
+        + _pb_varint(len(gql_msg))
     )
-    tail = _pb_field_varint(1, 1)
-    return _pb_field_bytes(1, envelope) + _pb_field_bytes(2, tail)
+    env_len = len(env_prefix) + len(gql_msg)
+    outer_head = _pb_varint((1 << 3) | 2) + _pb_varint(env_len)
+    outer_tail = _pb_field_bytes(2, _pb_field_varint(1, 1))
+    return (outer_head, env_prefix, gql_msg, outer_tail)
+
+
+def build_tedapi_query_request(
+    din, query_text=b"", query_sig=b"", variables_json=b"{}", graphql_payload=b""
+):
+    return b"".join(
+        build_tedapi_query_parts(
+            din,
+            query_text=query_text,
+            query_sig=query_sig,
+            variables_json=variables_json,
+            graphql_payload=graphql_payload,
+        )
+    )
 
 
 # --- TLS & HTTP/1.1 Transport (MicroPython v1.25.0 RP2040 compatible) ---
@@ -113,13 +131,19 @@ def _is_ipv4(host):
     return True
 
 
-def _wrap_tls(sock, host):
-    """Wrap socket in TLS with CERT_NONE (Powerwall 3 uses a self-signed cert)."""
-    sni = None if _is_ipv4(host) else host
+def _make_ssl_ctx():
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     if hasattr(ctx, "check_hostname"):
         ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def _wrap_tls(sock, host, ctx=None):
+    """Wrap socket in TLS with CERT_NONE (Powerwall 3 uses a self-signed cert)."""
+    sni = None if _is_ipv4(host) else host
+    if ctx is None:
+        ctx = _make_ssl_ctx()
     if sni:
         return ctx.wrap_socket(sock, server_hostname=sni)
     return ctx.wrap_socket(sock)
@@ -477,6 +501,77 @@ def _new_components_dict():
     }
 
 
+_INTERN_STR = {
+    "Pv_Active": "Pv_Active",
+    "Pv_Standby": "Pv_Standby",
+    "Pv_Active_Parallel": "Pv_Active_Parallel",
+}
+
+
+def _intern_or_copy(s):
+    if s is None:
+        return None
+    cached = _INTERN_STR.get(s)
+    if cached is not None:
+        return cached
+    return s.encode("utf-8").decode("utf-8")
+
+
+def _compact_num(v):
+    if v is None:
+        return None
+    return v + 0.0
+
+
+def _compact_components(tmp):
+    """
+    Re-pack extracted component values AFTER TLS and DeflateIO are closed & GC'd.
+    Prevents small strings/floats allocated above the 32 KB DeflateIO watermark
+    from pinning and fragmenting RP2040's non-compacting heap.
+    """
+    out = {
+        "strings": [
+            {
+                "id": srec["id"],
+                "state": _intern_or_copy(srec["state"]),
+                "v": _compact_num(srec["v"]),
+                "i": _compact_num(srec["i"]),
+                "w": _compact_num(srec["w"]),
+            }
+            for srec in tmp["strings"]
+        ],
+        "strings_dc_w": _compact_num(tmp["strings_dc_w"]),
+        "slow_pv_sum_w": _compact_num(tmp["slow_pv_sum_w"]),
+        "pack_temp_min": _compact_num(tmp["pack_temp_min"]),
+        "pack_temp_max": _compact_num(tmp["pack_temp_max"]),
+        "shunt_temp": _compact_num(tmp["shunt_temp"]),
+        "temp_oob": _compact_num(tmp["temp_oob"]),
+        "temp_oob_chg": _compact_num(tmp["temp_oob_chg"]),
+        "inv_ambient_temp": _compact_num(tmp["inv_ambient_temp"]),
+        "fan_rpm_a": _compact_num(tmp["fan_rpm_a"]),
+        "fan_rpm_b": _compact_num(tmp["fan_rpm_b"]),
+        "fan_duty_a": _compact_num(tmp["fan_duty_a"]),
+        "fan_duty_b": _compact_num(tmp["fan_duty_b"]),
+        "hvp_state": _intern_or_copy(tmp["hvp_state"]),
+        "baggr_state": _intern_or_copy(tmp["baggr_state"]),
+        "batt_connected": _compact_num(tmp["batt_connected"]),
+        "batt_expected": _compact_num(tmp["batt_expected"]),
+        "ac_v_ab": _compact_num(tmp["ac_v_ab"]),
+        "ac_v_an": _compact_num(tmp["ac_v_an"]),
+        "ac_v_bn": _compact_num(tmp["ac_v_bn"]),
+        "ac_freq": _compact_num(tmp["ac_freq"]),
+        "ac_mode": _intern_or_copy(tmp["ac_mode"]),
+        "pch_state": _intern_or_copy(tmp["pch_state"]),
+        "ac_power_w": _compact_num(tmp["ac_power_w"]),
+        "pch_batt_w": _compact_num(tmp["pch_batt_w"]),
+        "rsd_state": _intern_or_copy(tmp["rsd_state"]),
+        "prod_switch": _intern_or_copy(tmp["prod_switch"]),
+        "self_test": _intern_or_copy(tmp["self_test"]),
+        "time_str": _intern_or_copy(tmp.get("time_str")),
+    }
+    return out
+
+
 def _apply_component_object(obj, comp):
     name = _extract_string_after(obj, b'"name"')
     if not name:
@@ -501,7 +596,7 @@ def _apply_component_object(obj, comp):
             if name.startswith("PCH_PvState_"):
                 tv = _extract_string_after(obj, b'"textValue"')
                 if tv is not None:
-                    srec["state"] = tv
+                    srec["state"] = _INTERN_STR.get(tv, tv)
                 return
 
     num_spec = _COMP_NUM_SIGNALS.get(name)
@@ -529,14 +624,8 @@ def _apply_component_object(obj, comp):
             comp[text_key] = tv
         return
 
-    # Leaf alert objects in activeAlerts look like {"name":"ALERT_NAME"}
-    if b'"value"' not in obj and b'"timestamp"' not in obj and b'"signals"' not in obj:
-        alerts = comp["alerts"]
-        if len(alerts) < 10 and name not in alerts:
-            alerts.append(name)
 
-
-def _scan_stream_for_components(reader, comp, chunk_size=1024, wdt_feed=None):
+def _scan_stream_for_components(reader, comp, chunk_size=512, wdt_feed=None):
     """
     O(1)-RAM streaming scanner for TEDAPI ComponentsQuery responses.
     Processes each leaf JSON object `{...}` once as its closing brace arrives.
@@ -563,12 +652,12 @@ def _scan_stream_for_components(reader, comp, chunk_size=1024, wdt_feed=None):
             window = window[pos:]
         if not chunk:
             break
-        if len(window) > 512:
+        if len(window) > 384:
             last_open = window.rfind(b"{")
-            if last_open >= 0 and len(window) - last_open <= 512:
+            if last_open >= 0 and len(window) - last_open <= 384:
                 window = window[last_open:]
             else:
-                window = window[-512:]
+                window = window[-384:]
 
 
 def _scan_gzip_bytes(gz_bytes, target, scanner_fn=_scan_stream_for_metrics, wdt_feed=None):
@@ -583,6 +672,8 @@ def _scan_gzip_bytes(gz_bytes, target, scanner_fn=_scan_stream_for_metrics, wdt_
                 dstream.close()
             except Exception:
                 pass
+            dstream = None
+            bio = None
     elif zlib is not None:
         raw = zlib.decompress(gz_bytes, 16 + zlib.MAX_WBITS)
         scanner_fn(io.BytesIO(raw), target, chunk_size=1024, wdt_feed=wdt_feed)
@@ -637,6 +728,7 @@ class Powerwall3Client:
         self.components_query_vars = components_query_vars
 
         self._din = None
+        self._ssl_ctx = _make_ssl_ctx()
         raw_cred = ("Tesla_Energy_Device:" + gw_password).encode("utf-8")
         b64 = binascii.b2a_base64(raw_cred).strip().decode("ascii")
         self._basic_hdr = "Basic " + b64
@@ -647,6 +739,7 @@ class Powerwall3Client:
         path,
         content_type=None,
         body=b"",
+        body_parts=None,
         metrics=None,
         scanner_fn=None,
         wdt_feed=None,
@@ -655,8 +748,9 @@ class Powerwall3Client:
         Execute one HTTPS/1.1 request with strict socket/TLS cleanup.
         If metrics target dict is provided:
           - Uncompressed response is stream-scanned inline via scanner_fn.
-          - Gzipped response is buffered (~2-4 KB), TLS is closed & GC'd FIRST,
-            then decompressed in a separate peak-memory phase for RP2040 safety.
+          - Gzipped response is buffered (~2-6 KB), TLS is closed & GC'd FIRST
+            (with all socket/reader references cleared), then decompressed in a
+            separate peak-memory phase for RP2040 safety.
         """
         gc.collect()
         if wdt_feed:
@@ -667,10 +761,18 @@ class Powerwall3Client:
 
         raw_sock = None
         tls_sock = None
+        reader = None
         resp_headers = {}
         gz_buf = None
         small_body = b""
         phase = "connect"
+
+        if body_parts is not None:
+            body_len = 0
+            for part in body_parts:
+                body_len += len(part)
+        else:
+            body_len = len(body) if body else 0
 
         try:
             addr = socket.getaddrinfo(self.host, self.port)[0][-1]
@@ -681,7 +783,7 @@ class Powerwall3Client:
                 wdt_feed()
 
             phase = "tls"
-            tls_sock = _wrap_tls(raw_sock, self.host)
+            tls_sock = _wrap_tls(raw_sock, self.host, ctx=self._ssl_ctx)
             if wdt_feed:
                 wdt_feed()
 
@@ -696,12 +798,18 @@ class Powerwall3Client:
             ]
             if content_type:
                 req_lines.append("Content-Type: {}".format(content_type))
-            if body:
-                req_lines.append("Content-Length: {}".format(len(body)))
+            if body_len:
+                req_lines.append("Content-Length: {}".format(body_len))
             req_head = ("\r\n".join(req_lines) + "\r\n\r\n").encode("ascii")
 
             _send_all(tls_sock, req_head)
-            if body:
+            req_head = None
+            req_lines = None
+            if body_parts is not None:
+                for part in body_parts:
+                    if part:
+                        _send_all(tls_sock, part)
+            elif body:
                 _send_all(tls_sock, body)
             if wdt_feed:
                 wdt_feed()
@@ -742,23 +850,41 @@ class Powerwall3Client:
 
             if metrics is not None:
                 if "gzip" in ce:
-                    # Buffer tiny compressed gzip body (~1.7-6 KB); decompress after TLS closes
-                    gz_buf = bytearray()
-                    while len(gz_buf) < 24576:
-                        if wdt_feed:
-                            wdt_feed()
-                        try:
-                            c = reader.read(512)
-                        except OSError:
-                            if cl is None and len(gz_buf) > 0:
+                    # Pre-allocate exact buffer when Content-Length is known (zero doubling fragmentation)
+                    if cl is not None and 0 < cl <= 24576:
+                        gz_buf = bytearray(cl)
+                        mv = memoryview(gz_buf)
+                        got = 0
+                        while got < cl:
+                            if wdt_feed:
+                                wdt_feed()
+                            want = 512 if (cl - got) > 512 else (cl - got)
+                            c = reader.read(want)
+                            if not c:
                                 break
-                            raise
-                        if not c:
-                            break
-                        gz_buf.extend(c)
+                            n = len(c)
+                            mv[got:got + n] = c
+                            got += n
+                        mv = None
+                        if got < cl:
+                            gz_buf = gz_buf[:got]
+                    else:
+                        gz_buf = bytearray()
+                        while len(gz_buf) < 24576:
+                            if wdt_feed:
+                                wdt_feed()
+                            try:
+                                c = reader.read(512)
+                            except OSError:
+                                if cl is None and len(gz_buf) > 0:
+                                    break
+                                raise
+                            if not c:
+                                break
+                            gz_buf.extend(c)
                 else:
                     try:
-                        scanner_fn(reader, metrics, chunk_size=1024, wdt_feed=wdt_feed)
+                        scanner_fn(reader, metrics, chunk_size=512, wdt_feed=wdt_feed)
                     except OSError:
                         has_partial = (
                             cl is None
@@ -785,23 +911,31 @@ class Powerwall3Client:
         except OSError as e:
             raise PowerwallError("{}@{}: {}".format(phase, path, e))
         finally:
+            reader = None
             if tls_sock is not None:
                 try:
                     tls_sock.close()
                 except Exception:
                     pass
+                tls_sock = None
             if raw_sock is not None:
                 try:
                     raw_sock.close()
                 except Exception:
                     pass
+                raw_sock = None
             gc.collect()
 
-        # Phase 2 (TLS RAM already freed!): decompress gzip if gateway compressed it
+        # Phase 2 (TLS RAM already freed!): decompress gzip directly from gz_buf (no copy!)
         if gz_buf is not None:
-            _scan_gzip_bytes(bytes(gz_buf), metrics, scanner_fn=scanner_fn, wdt_feed=wdt_feed)
-            gz_buf = None
-            gc.collect()
+            phase = "gzip"
+            try:
+                _scan_gzip_bytes(gz_buf, metrics, scanner_fn=scanner_fn, wdt_feed=wdt_feed)
+            except (OSError, MemoryError) as e:
+                raise PowerwallError("{}@{}: {}".format(phase, path, e))
+            finally:
+                gz_buf = None
+                gc.collect()
 
         return resp_headers, small_body
 
@@ -820,7 +954,7 @@ class Powerwall3Client:
             raise PowerwallError("Run export_tedapi_query.py first")
 
         din = self._ensure_din(wdt_feed=wdt_feed)
-        req_pb = build_tedapi_query_request(
+        req_parts = build_tedapi_query_parts(
             din,
             query_text=self.query_text,
             query_sig=self.query_sig,
@@ -848,12 +982,12 @@ class Powerwall3Client:
             "POST",
             "/tedapi/v1",
             content_type="application/octet-stream",
-            body=req_pb,
+            body_parts=req_parts,
             metrics=metrics,
             scanner_fn=_scan_stream_for_metrics,
             wdt_feed=wdt_feed,
         )
-        del req_pb
+        req_parts = None
         gc.collect()
 
         rem = metrics["remaining_wh"]
@@ -862,60 +996,86 @@ class Powerwall3Client:
             raise PowerwallError("Missing Wh fields in TEDAPI response")
 
         raw_soc = (rem / full) * 100.0
-        metrics["soc_raw"] = raw_soc
-        metrics["soc_pct"] = scale_soc_to_app(raw_soc) if self.soc_scale_to_app else raw_soc
         exp_lim = metrics["exp_lim_active_w"]
         if exp_lim is None:
             exp_lim = metrics["exp_lim_default_w"]
-        metrics["exp_lim_w"] = exp_lim
-        metrics["time_str"] = (
+        t_str = (
             _parse_iso_hhmm(metrics["sys_time"], self.utc_offset_hours)
             or _parse_date_hhmm(resp_hdrs.get("date"), self.utc_offset_hours)
         )
-        return metrics
+        resp_hdrs = None
+        gc.collect()
+
+        # Re-pack into bottom of heap AFTER TLS & DeflateIO are freed
+        out = {
+            "remaining_wh": _compact_num(rem),
+            "full_wh": _compact_num(full),
+            "soc_raw": _compact_num(raw_soc),
+            "soc_pct": _compact_num(scale_soc_to_app(raw_soc) if self.soc_scale_to_app else raw_soc),
+            "batt_w": _compact_num(metrics["batt_w"]),
+            "solar_w": _compact_num(metrics["solar_w"]),
+            "load_w": _compact_num(metrics["load_w"]),
+            "site_w": _compact_num(metrics["site_w"]),
+            "grid_ok": metrics["grid_ok"],
+            "site_shutdown": metrics["site_shutdown"],
+            "exp_lim_w": _compact_num(exp_lim),
+            "sys_time": _intern_or_copy(metrics["sys_time"]),
+            "time_str": _intern_or_copy(t_str),
+        }
+        metrics = None
+        gc.collect()
+        return out
 
     def poll_components(self, wdt_feed=None):
         """
         Poll Powerwall 3 ComponentsQuery (solar strings A-F, pack/inverter temps,
-        fan RPM/duty, AC grid voltage/frequency, and PWS/HVP/BAGGR states).
+        fan RPM/duty, AC grid voltage/frequency, and BMS over-temp counters).
         Called on-demand only when displaying a detail view.
         """
         if self.host == "192.168.91.1" and not self.components_payload:
             raise PowerwallError("Re-run export_tedapi_query.py")
 
         din = self._ensure_din(wdt_feed=wdt_feed)
-        req_pb = build_tedapi_query_request(
+        req_parts = build_tedapi_query_parts(
             din,
             query_text=self.components_query_text,
             query_sig=self.components_query_sig,
             variables_json=self.components_query_vars,
             graphql_payload=self.components_payload,
         )
-        comp = _new_components_dict()
+        tmp_comp = _new_components_dict()
         resp_hdrs, _ = self._https_request(
             "POST",
             "/tedapi/v1",
             content_type="application/octet-stream",
-            body=req_pb,
-            metrics=comp,
+            body_parts=req_parts,
+            metrics=tmp_comp,
             scanner_fn=_scan_stream_for_components,
             wdt_feed=wdt_feed,
         )
-        del req_pb
-        gc.collect()
+        req_parts = None
 
-        if comp["_seen_signals"] == 0:
+        if tmp_comp["_seen_signals"] == 0:
+            tmp_comp = None
+            gc.collect()
             raise PowerwallError("No component signals in response")
 
         total_dc = 0.0
-        for srec in comp["strings"]:
+        for srec in tmp_comp["strings"]:
             v = srec["v"] or 0.0
             i = srec["i"] or 0.0
             w = v * i
             srec["w"] = w
             total_dc += w
-        comp["strings_dc_w"] = total_dc
-        comp["time_str"] = _parse_date_hhmm(
+        tmp_comp["strings_dc_w"] = total_dc
+        tmp_comp["time_str"] = _parse_date_hhmm(
             resp_hdrs.get("date"), self.utc_offset_hours
         )
+        resp_hdrs = None
+        gc.collect()
+
+        # Re-pack into bottom of heap AFTER TLS & DeflateIO are freed
+        comp = _compact_components(tmp_comp)
+        tmp_comp = None
+        gc.collect()
         return comp

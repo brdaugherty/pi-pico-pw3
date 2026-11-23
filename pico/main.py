@@ -942,23 +942,26 @@ def main():
     def _run_components_poll():
         global comp_data, comp_last_ms, comp_poll_pending, cooldown_until_ms
         global status_msg, status_is_err, consec_errors
+        gc.collect()
         try:
             c = client.poll_components(wdt_feed=wdt_feed)
             comp_data = c
+            c = None
+            gc.collect()
             comp_last_ms = time.ticks_ms()
             comp_poll_pending = False
-            if c.get("time_str") and latest["time_str"] == "--:--":
-                latest["time_str"] = c["time_str"]
+            if comp_data.get("time_str") and latest["time_str"] == "--:--":
+                latest["time_str"] = comp_data["time_str"]
             status_msg = "OK (VITALS)"
             status_is_err = False
             print(
                 "VITALS: DC={:.0f}W VAB={}V FREQ={}Hz TMAX={}C OOB={}/{} FREE={}B".format(
-                    c["strings_dc_w"],
-                    c["ac_v_ab"],
-                    c["ac_freq"],
-                    c["pack_temp_max"],
-                    c["temp_oob"],
-                    c["temp_oob_chg"],
+                    comp_data["strings_dc_w"],
+                    comp_data["ac_v_ab"],
+                    comp_data["ac_freq"],
+                    comp_data["pack_temp_max"],
+                    comp_data["temp_oob"],
+                    comp_data["temp_oob_chg"],
                     gc.mem_free(),
                 )
             )
@@ -982,9 +985,10 @@ def main():
             return False
         except Exception as e:
             comp_poll_pending = False
+            gc.collect()
             status_msg = "VITALS: " + str(e)[:14]
             status_is_err = True
-            print("Vitals poll error:", e)
+            print("Vitals poll error:", e, "FREE={}B".format(gc.mem_free()))
             return False
 
     while True:
@@ -1045,6 +1049,7 @@ def main():
         if time.ticks_diff(now, next_poll_ms) >= 0:
             if ensure_wifi(wlan, wdt_feed):
                 try:
+                    gc.collect()
                     data = client.poll(wdt_feed=wdt_feed)
                     latest["soc_pct"] = data["soc_pct"]
                     latest["remaining_wh"] = data["remaining_wh"]
@@ -1058,6 +1063,8 @@ def main():
                     latest["exp_lim_w"] = data["exp_lim_w"]
                     if data["time_str"]:
                         latest["time_str"] = data["time_str"]
+                    data = None
+                    gc.collect()
 
                     push_history(latest["soc_pct"], latest["remaining_wh"])
 
@@ -1097,11 +1104,12 @@ def main():
                     print("Auth error:", e)
                 except Exception as e:
                     consec_errors += 1
+                    gc.collect()
                     status_msg = "ERR: " + str(e)[:18]
                     status_is_err = True
                     backoff_s = min(120, 10 * (1 << min(consec_errors, 4)))
                     delay_ms = backoff_s * 1000
-                    print("Poll error:", e)
+                    print("Poll error:", e, "FREE={}B".format(gc.mem_free()))
             else:
                 consec_errors += 1
                 delay_ms = 15000
