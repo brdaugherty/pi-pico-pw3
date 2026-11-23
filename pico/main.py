@@ -92,6 +92,9 @@ comp_data = None
 comp_last_ms = None
 comp_poll_pending = False
 cooldown_until_ms = None
+ALERT_TICK_MS = 3000
+alert_idx = 0
+last_alert_tick_ms = time.ticks_ms()
 
 status_msg = "BOOTING PW3..."
 status_is_err = False
@@ -311,21 +314,37 @@ def draw_power_flow():
 def _short_state(val, max_len=14):
     if not val:
         return "--"
-    s = str(val)
-    for prefix in (
-        "PCH_AcMode_",
-        "PCH_State_",
-        "HVP_State_",
-        "BAGGR_State_",
-        "PWS_RSD_",
-        "PWS_ProdSwitch_",
-        "PWS_SelfTest_",
-        "Pv_",
-    ):
-        if s.startswith(prefix):
-            s = s[len(prefix):]
+    s = str(val).strip()
+    if not s:
+        return "--"
+    # Strip any "<PREFIX>_State_" or "<PREFIX>_STATE_" segment (e.g. RSD_State_Armed)
+    pos = s.lower().find("_state_")
+    if pos >= 0 and pos + 7 < len(s):
+        s = s[pos + 7:]
+    else:
+        for prefix in (
+            "PCH_AcMode_",
+            "AcMode_",
+            "PWS_ProdSwitch_",
+            "ProdSwitch_",
+            "PWS_SelfTest_",
+            "SelfTest_",
+            "PWS_RSD_",
+            "RSD_TEST_",
+            "RSD_",
+            "Pv_",
+        ):
+            if s.startswith(prefix):
+                s = s[len(prefix):]
+                break
+    # If still longer than max_len and underscore-delimited, drop leading prefix tokens
+    while len(s) > max_len and "_" in s:
+        tail = s.split("_", 1)[1]
+        if not tail:
             break
-    return s[:max_len]
+        s = tail
+    s = s.rstrip("_")
+    return s[:max_len] if s else "--"
 
 
 def _draw_detail_card(cx, cy, cw, ch, col, title, main_str, sub_str):
@@ -347,7 +366,12 @@ def _draw_alerts_bar(alerts, extra_right=""):
     if alerts:
         display.set_pen(C_RED)
         display.rectangle(bx, by, 4, bh)
-        msg = "ALERTS ({}): {}".format(len(alerts), alerts[0])
+        n = len(alerts)
+        if n == 1:
+            msg = "ALERT: {}".format(alerts[0])
+        else:
+            idx = alert_idx % n
+            msg = "ALRT {}/{}: {}".format(idx + 1, n, alerts[idx])
         display.text(msg[:46], bx + 10, by + 10, scale=1)
     else:
         display.set_pen(C_GREEN)
@@ -696,6 +720,7 @@ def ensure_wifi(wlan, wdt_feed):
 def main():
     global view_mode, bl_mode, last_input_ms, status_msg, status_is_err, consec_errors
     global comp_data, comp_last_ms, comp_poll_pending, cooldown_until_ms
+    global alert_idx, last_alert_tick_ms
 
     set_backlight(config.BACKLIGHT_ACTIVE)
     draw_ui()
@@ -736,26 +761,34 @@ def main():
 
     def _run_components_poll():
         global comp_data, comp_last_ms, comp_poll_pending, cooldown_until_ms
-        global status_msg, status_is_err, consec_errors
+        global status_msg, status_is_err, consec_errors, alert_idx, last_alert_tick_ms
         try:
             c = client.poll_components(wdt_feed=wdt_feed)
             comp_data = c
             comp_last_ms = time.ticks_ms()
             comp_poll_pending = False
+            if c["alerts"]:
+                alert_idx %= len(c["alerts"])
+            else:
+                alert_idx = 0
+            last_alert_tick_ms = comp_last_ms
             if c.get("time_str"):
                 latest["time_str"] = c["time_str"]
             status_msg = "OK (VITALS)"
             status_is_err = False
             print(
-                "VITALS: DC={:.0f}W VAB={}V FREQ={}Hz TMAX={}C ALERTS={} FREE={}B".format(
+                "VITALS: DC={:.0f}W VAB={}V FREQ={}Hz TMAX={}C RSD={} ALERTS={} FREE={}B".format(
                     c["strings_dc_w"],
                     c["ac_v_ab"],
                     c["ac_freq"],
                     c["pack_temp_max"],
+                    c["rsd_state"],
                     len(c["alerts"]),
                     gc.mem_free(),
                 )
             )
+            if c["alerts"]:
+                print("ACTIVE ALERTS (0-9):", c["alerts"])
             return True
         except RateLimitError as e:
             consec_errors += 1
@@ -803,6 +836,8 @@ def main():
                 elif i == 3:
                     bl_mode = (bl_mode + 1) % 3
                 if is_detail_view():
+                    alert_idx = 0
+                    last_alert_tick_ms = now
                     if comp_last_ms is None or time.ticks_diff(now, comp_last_ms) >= comp_fresh_ms:
                         comp_poll_pending = True
                 else:
@@ -810,6 +845,19 @@ def main():
                 dirty = True
         prev_btn = cur_btn
         update_backlight(now)
+
+        # Rotate alert ticker every ALERT_TICK_MS on Battery/Grid detail views
+        if (
+            not dirty
+            and bl_mode != BL_OFF
+            and view_mode in (VIEW_BATT_DETAIL, VIEW_GRID_DETAIL)
+            and comp_data is not None
+            and len(comp_data["alerts"]) > 1
+            and time.ticks_diff(now, last_alert_tick_ms) >= ALERT_TICK_MS
+        ):
+            alert_idx = (alert_idx + 1) % len(comp_data["alerts"])
+            last_alert_tick_ms = now
+            dirty = True
 
         if dirty:
             draw_ui()

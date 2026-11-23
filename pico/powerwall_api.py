@@ -469,7 +469,7 @@ def _apply_component_object(obj, comp):
     # Leaf alert objects in activeAlerts look like {"name":"ALERT_NAME"}
     if b'"value"' not in obj and b'"timestamp"' not in obj and b'"signals"' not in obj:
         alerts = comp["alerts"]
-        if len(alerts) < 6 and name not in alerts:
+        if len(alerts) < 10 and name not in alerts:
             alerts.append(name)
 
 

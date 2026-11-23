@@ -153,8 +153,8 @@ def simulated_components(st):
             "pws": [
                 {
                     "signals": [
-                        _sig("PWS_RSD_State", 1, "PWS_RSD_Normal"),
-                        _sig("PWS_ProdSwitch_State", 1, "PWS_ProdSwitch_Closed"),
+                        _sig("PWS_RSD_State", 1, "RSD_State_Armed"),
+                        _sig("PWS_ProdSwitch_State", 1, "PWS_SWITCH_STATE_CLOSED"),
                         _sig("PWS_SelfTest", 1, "PWS_SelfTest_Passed"),
                     ],
                     "activeAlerts": [],
