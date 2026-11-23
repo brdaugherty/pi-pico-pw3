@@ -9,6 +9,7 @@
 # The placeholder below works with tools/mock_powerwall.py for bench testing.
 
 IS_REAL_SIGNED_QUERY = False
+PAYLOAD_FILE = ""
 GRAPHQL_PAYLOAD = b""
 COMPONENTS_PAYLOAD = b""
 

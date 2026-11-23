@@ -1,16 +1,8 @@
 # pico/powerwall_api.py
-# Ultra-lean Tesla Powerwall 3 TEDAPI HTTPS/1.1 + Protobuf client
-# Tuned for Raspberry Pi Pico W (RP2040, 264 KB SRAM, MicroPython v1.25.0).
-# Also runs on CPython 3 for desktop testing against tools/mock_powerwall.py.
-#
-# RP2040 Memory Strategy:
-#   - Zero external libraries, zero custom C firmware, zero flash writes.
-#   - Explicit gc.collect() before every TLS handshake.
-#   - NEVER overlaps mbedTLS (~44 KB) with deflate.DeflateIO GZIP (~32 KB):
-#     * Uncompressed responses: stream-scanned directly off TLS in 1 KB chunks (~2 KB RAM).
-#     * Gzipped responses (~1.7-4 KB compressed): buffered into a tiny bytearray,
-#       TLS+TCP sockets are CLOSED and gc.collect()ed FIRST, then decompressed
-#       and stream-scanned in 512 B chunks.
+# Ultra-lean Tesla Powerwall 3 TEDAPI HTTPS/1.1 + Protobuf client for RP2040 (264 KB SRAM).
+# Streams signed payloads directly from flash (tedapi.bin -> 0 B payload RAM),
+# never overlaps mbedTLS (~44 KB) with deflate.DeflateIO (~32 KB), and repacks
+# results after GC so nothing pins mid-heap.
 
 import binascii
 import gc
@@ -40,11 +32,9 @@ class AuthError(PowerwallError):
     pass
 
 
-# --- Minimal Protobuf Wire Encoder (TEDAPI /tedapi/v1) ---
-
-def _pb_varint(value):
+def _pb_varint(v):
     out = bytearray()
-    v = int(value)
+    v = int(v)
     while v > 0x7F:
         out.append((v & 0x7F) | 0x80)
         v >>= 7
@@ -52,57 +42,44 @@ def _pb_varint(value):
     return bytes(out)
 
 
-def _pb_field_varint(field_num, value):
-    return _pb_varint((field_num << 3) | 0) + _pb_varint(value)
+def _pb_int(f, v):
+    return _pb_varint((f << 3) | 0) + _pb_varint(v)
 
 
-def _pb_field_bytes(field_num, payload):
-    if isinstance(payload, str):
-        payload = payload.encode("utf-8")
-    return _pb_varint((field_num << 3) | 2) + _pb_varint(len(payload)) + payload
+def _pb_bytes(f, p):
+    if isinstance(p, str):
+        p = p.encode("utf-8")
+    return _pb_varint((f << 3) | 2) + _pb_varint(len(p)) + p
 
 
 def build_tedapi_query_parts(
-    din, query_text=b"", query_sig=b"", variables_json=b"{}", graphql_payload=b""
+    din, query_text=b"", query_sig=b"", variables_json=b"{}",
+    graphql_payload=b"", payload_slice=None,
 ):
-    """
-    Build wire-exact TEDAPI Message / AuthEnvelope protobuf parts for POST /tedapi/v1
-    without copying large graphql_payload / components_payload buffers on RP2040:
-      1 (MessageEnvelope):
-        1: 1                         (deliveryChannel = LOCAL_HTTPS)
-        2: { 3: 1 }                  (sender.local = INSTALLER)
-        3: { 1: <din> }              (recipient.din)
-        16 (GraphQLMessages):        (raw graphql_payload from export_tedapi_query.py,
-                                      or encoded from query_text/query_sig for mock)
-      2 (Tail / ExternalAuth):
-        1: 1                         (value = 1 / EXTERNAL_AUTH_TYPE_PRESENCE)
-    """
-    if graphql_payload:
-        gql_msg = graphql_payload
+    """Return tuple of bytes / (file_path, offset, length) slices for zero-copy POST."""
+    if payload_slice is not None:
+        gql_part = payload_slice
+        gql_len = payload_slice[2]
+    elif graphql_payload:
+        gql_part = graphql_payload
+        gql_len = len(graphql_payload)
     else:
-        query_inner = _pb_field_varint(1, 1) + _pb_field_bytes(2, query_text)
-        vars_inner = _pb_field_bytes(1, variables_json)
-        gql_send = (
-            _pb_field_varint(1, 2)
-            + _pb_field_bytes(2, query_inner)
-            + _pb_field_bytes(3, query_sig)
-            + _pb_field_bytes(4, vars_inner)
-        )
-        gql_msg = _pb_field_bytes(1, gql_send)
+        qi = _pb_int(1, 1) + _pb_bytes(2, query_text)
+        vi = _pb_bytes(1, variables_json)
+        gs = _pb_int(1, 2) + _pb_bytes(2, qi) + _pb_bytes(3, query_sig) + _pb_bytes(4, vi)
+        gql_part = _pb_bytes(1, gs)
+        gql_len = len(gql_part)
 
-    sender = _pb_field_varint(3, 1)
-    recipient = _pb_field_bytes(1, din)
-    env_prefix = (
-        _pb_field_varint(1, 1)
-        + _pb_field_bytes(2, sender)
-        + _pb_field_bytes(3, recipient)
+    env_pre = (
+        _pb_int(1, 1)
+        + _pb_bytes(2, _pb_int(3, 1))
+        + _pb_bytes(3, _pb_bytes(1, din))
         + _pb_varint((16 << 3) | 2)
-        + _pb_varint(len(gql_msg))
+        + _pb_varint(gql_len)
     )
-    env_len = len(env_prefix) + len(gql_msg)
-    outer_head = _pb_varint((1 << 3) | 2) + _pb_varint(env_len)
-    outer_tail = _pb_field_bytes(2, _pb_field_varint(1, 1))
-    return (outer_head, env_prefix, gql_msg, outer_tail)
+    head = _pb_varint((1 << 3) | 2) + _pb_varint(len(env_pre) + gql_len)
+    tail = _pb_bytes(2, _pb_int(1, 1))
+    return (head, env_pre, gql_part, tail)
 
 
 def build_tedapi_query_request(
@@ -110,63 +87,54 @@ def build_tedapi_query_request(
 ):
     return b"".join(
         build_tedapi_query_parts(
-            din,
-            query_text=query_text,
-            query_sig=query_sig,
-            variables_json=variables_json,
-            graphql_payload=graphql_payload,
+            din, query_text, query_sig, variables_json, graphql_payload
         )
     )
 
 
-# --- TLS & HTTP/1.1 Transport (MicroPython v1.25.0 RP2040 compatible) ---
-
 def _is_ipv4(host):
     parts = host.split(".")
-    if len(parts) != 4:
-        return False
-    for p in parts:
-        if not p.isdigit():
-            return False
-    return True
+    return len(parts) == 4 and all(p.isdigit() for p in parts)
 
 
-def _make_ssl_ctx():
+def _wrap_tls(sock, host):
+    sni = None if _is_ipv4(host) else host
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     if hasattr(ctx, "check_hostname"):
         ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    return ctx
-
-
-def _wrap_tls(sock, host, ctx=None):
-    """Wrap socket in TLS with CERT_NONE (Powerwall 3 uses a self-signed cert)."""
-    sni = None if _is_ipv4(host) else host
-    if ctx is None:
-        ctx = _make_ssl_ctx()
-    if sni:
-        return ctx.wrap_socket(sock, server_hostname=sni)
-    return ctx.wrap_socket(sock)
+    return ctx.wrap_socket(sock, server_hostname=sni) if sni else ctx.wrap_socket(sock)
 
 
 def _send_all(stream, data):
     mv = memoryview(data)
-    total = len(data)
+    tot = len(data)
     sent = 0
-    while sent < total:
-        if hasattr(stream, "write"):
-            n = stream.write(mv[sent:])
-        else:
-            n = stream.send(mv[sent:])
-        if n is None or n <= 0:
+    w = stream.write if hasattr(stream, "write") else stream.send
+    while sent < tot:
+        n = w(mv[sent:])
+        if not n or n <= 0:
             raise PowerwallError("Socket write failed")
         sent += n
 
 
+def _send_file_slice(stream, path, offset, length):
+    buf = bytearray(512)
+    mv = memoryview(buf)
+    rem = length
+    with open(path, "rb") as f:
+        f.seek(offset)
+        while rem > 0:
+            want = 512 if rem > 512 else rem
+            n = f.readinto(mv[:want])
+            if not n:
+                raise PowerwallError("Short tedapi.bin read")
+            _send_all(stream, mv[:n])
+            rem -= n
+
+
 def _read_some(stream, n):
-    if hasattr(stream, "read"):
-        return stream.read(n)
-    return stream.recv(n)
+    return stream.read(n) if hasattr(stream, "read") else stream.recv(n)
 
 
 def _read_line(stream, max_len=1024):
@@ -185,38 +153,29 @@ def _read_line(stream, max_len=1024):
 
 
 def _parse_date_hhmm(date_hdr, utc_offset_hours=0):
-    """Extract HH:MM from HTTP Date header, e.g. 'Sun, 22 Nov 2026 19:45:12 GMT'."""
     if not date_hdr:
         return None
-    for token in date_hdr.split():
-        if len(token) == 8 and token[2] == ":" and token[5] == ":":
+    for tok in date_hdr.split():
+        if len(tok) == 8 and tok[2] == ":" and tok[5] == ":":
             try:
-                hh = (int(token[0:2]) + int(utc_offset_hours)) % 24
-                mm = int(token[3:5])
-                return "{:02d}:{:02d}".format(hh, mm)
+                hh = (int(tok[0:2]) + int(utc_offset_hours)) % 24
+                return "{:02d}:{:02d}".format(hh, int(tok[3:5]))
             except ValueError:
                 return None
     return None
 
 
 def _parse_iso_hhmm(iso_str, utc_offset_hours=0):
-    """
-    Extract HH:MM from Powerwall system.time ISO-8601 string, e.g.
-    '2026-11-23T08:44:27-08:00' (already site-local with DST).
-    Only applies utc_offset_hours if the timestamp explicitly ends with 'Z'.
-    """
     if not iso_str:
         return None
-    t_idx = iso_str.find("T")
-    if t_idx < 0:
-        t_idx = iso_str.find(" ")
-    if t_idx < 0 or len(iso_str) < t_idx + 6:
-        return None
-    if iso_str[t_idx + 3] != ":":
+    ti = iso_str.find("T")
+    if ti < 0:
+        ti = iso_str.find(" ")
+    if ti < 0 or len(iso_str) < ti + 6 or iso_str[ti + 3] != ":":
         return None
     try:
-        hh = int(iso_str[t_idx + 1:t_idx + 3])
-        mm = int(iso_str[t_idx + 4:t_idx + 6])
+        hh = int(iso_str[ti + 1:ti + 3])
+        mm = int(iso_str[ti + 4:ti + 6])
         if iso_str.endswith("Z"):
             hh = (hh + int(utc_offset_hours)) % 24
         if 0 <= hh <= 23 and 0 <= mm <= 59:
@@ -227,14 +186,12 @@ def _parse_iso_hhmm(iso_str, utc_offset_hours=0):
 
 
 class _ChunkedReader:
-    """Minimal HTTP/1.1 Transfer-Encoding: chunked reader."""
-
-    def __init__(self, stream):
-        self._s = stream
+    def __init__(self, s):
+        self._s = s
         self._rem = 0
         self._eof = False
 
-    def read(self, n=1024):
+    def read(self, n=512):
         if self._eof:
             return b""
         while self._rem == 0:
@@ -242,15 +199,14 @@ class _ChunkedReader:
             if not line:
                 self._eof = True
                 return b""
-            size_str = line.split(b";", 1)[0].strip()
-            if not size_str:
+            sz = line.split(b";", 1)[0].strip()
+            if not sz:
                 continue
-            self._rem = int(size_str, 16)
+            self._rem = int(sz, 16)
             if self._rem == 0:
                 self._eof = True
                 return b""
-        want = n if n < self._rem else self._rem
-        chunk = _read_some(self._s, want)
+        chunk = _read_some(self._s, n if n < self._rem else self._rem)
         if not chunk:
             self._eof = True
             return b""
@@ -261,36 +217,29 @@ class _ChunkedReader:
 
 
 class _LengthReader:
-    """Bounded reader for Content-Length (or read-to-EOF if length is None)."""
-
-    def __init__(self, stream, length):
-        self._s = stream
+    def __init__(self, s, length):
+        self._s = s
         self._rem = length
 
-    def read(self, n=1024):
+    def read(self, n=512):
         if self._rem is not None:
             if self._rem <= 0:
                 return b""
-            want = n if n < self._rem else self._rem
-            chunk = _read_some(self._s, want)
+            chunk = _read_some(self._s, n if n < self._rem else self._rem)
             if chunk:
                 self._rem -= len(chunk)
             return chunk or b""
         return _read_some(self._s, n) or b""
 
 
-# --- O(1)-RAM Streaming Telemetry Scanner ---
-
-def _extract_number_after(buf, key_bytes, start=0):
-    idx = buf.find(key_bytes, start)
-    if idx < 0:
+def _extract_num(buf, key, start=0):
+    i = buf.find(key, start)
+    if i < 0:
         return None
-    p = idx + len(key_bytes)
+    p = i + len(key)
     n = len(buf)
     while p < n and buf[p] in b" \t\r\n:":
         p += 1
-    if p >= n:
-        return None
     end = p
     while end < n and buf[end] in b"0123456789.-+eE":
         end += 1
@@ -302,11 +251,11 @@ def _extract_number_after(buf, key_bytes, start=0):
         return None
 
 
-def _extract_bool_after(buf, key_bytes):
-    idx = buf.find(key_bytes)
-    if idx < 0:
+def _extract_bool(buf, key):
+    i = buf.find(key)
+    if i < 0:
         return None
-    p = idx + len(key_bytes)
+    p = i + len(key)
     n = len(buf)
     while p < n and buf[p] in b" \t\r\n:":
         p += 1
@@ -317,36 +266,32 @@ def _extract_bool_after(buf, key_bytes):
     return None
 
 
-def _extract_string_after(buf, key_bytes, start=0):
-    idx = buf.find(key_bytes, start)
-    if idx < 0:
+def _extract_str(buf, key, start=0):
+    i = buf.find(key, start)
+    if i < 0:
         return None
-    p = idx + len(key_bytes)
+    p = i + len(key)
     n = len(buf)
     while p < n and buf[p] in b" \t\r\n:":
         p += 1
-    if p >= n or buf[p] != 0x22:  # '"'
+    if p >= n or buf[p] != 0x22:
         return None
     p += 1
-    end = p
-    while end < n:
-        ch = buf[end]
-        if ch == 0x5C:  # '\\'
-            end += 2
+    e = p
+    while e < n:
+        c = buf[e]
+        if c == 0x5C:
+            e += 2
             continue
-        if ch == 0x22:  # '"'
-            return buf[p:end].decode("utf-8", "ignore")
-        end += 1
+        if c == 0x22:
+            return buf[p:e].decode("utf-8", "ignore")
+        e += 1
     return None
 
 
-def _scan_stream_for_metrics(reader, metrics, chunk_size=1024, wdt_feed=None):
-    """
-    Scan a protobuf-wrapped TEDAPI JSON stream in small chunks with a 192-byte
-    sliding window. Extracts only the required Powerwall 3 metrics in O(1) RAM.
-    """
-    window = b""
-    meter_keys = (
+def _scan_stream_for_metrics(reader, m, chunk_size=512, wdt_feed=None):
+    w = b""
+    meters = (
         (b'"BATTERY"', "batt_w"),
         (b'"SOLAR"', "solar_w"),
         (b'"LOAD"', "load_w"),
@@ -357,341 +302,219 @@ def _scan_stream_for_metrics(reader, metrics, chunk_size=1024, wdt_feed=None):
             wdt_feed()
         chunk = reader.read(chunk_size)
         if not chunk:
-            if window:
-                window += b" "
+            if w:
+                w += b" "
             else:
                 break
         else:
-            window += chunk
+            w += chunk
 
-        if metrics["remaining_wh"] is None:
-            v = _extract_number_after(window, b'"nominalEnergyRemainingWh"')
+        if m["remaining_wh"] is None:
+            v = _extract_num(w, b'"nominalEnergyRemainingWh"')
             if v is not None:
-                metrics["remaining_wh"] = v
-
-        if metrics["full_wh"] is None:
-            v = _extract_number_after(window, b'"nominalFullPackEnergyWh"')
+                m["remaining_wh"] = v
+        if m["full_wh"] is None:
+            v = _extract_num(w, b'"nominalFullPackEnergyWh"')
             if v is not None:
-                metrics["full_wh"] = v
-
-        if metrics["grid_ok"] is None:
-            b = _extract_bool_after(window, b'"gridOK"')
+                m["full_wh"] = v
+        if m["grid_ok"] is None:
+            b = _extract_bool(w, b'"gridOK"')
             if b is not None:
-                metrics["grid_ok"] = b
-
-        if metrics.get("site_shutdown") is None:
-            b = _extract_bool_after(window, b'"isShutDown"')
+                m["grid_ok"] = b
+        if m.get("site_shutdown") is None:
+            b = _extract_bool(w, b'"isShutDown"')
             if b is not None:
-                metrics["site_shutdown"] = b
-
-        if metrics.get("sys_time") is None:
-            spos = window.find(b'"system"')
-            if spos >= 0:
-                ts = _extract_string_after(window, b'"time"', spos)
+                m["site_shutdown"] = b
+        if m.get("sys_time") is None:
+            sp = w.find(b'"system"')
+            if sp >= 0:
+                ts = _extract_str(w, b'"time"', sp)
                 if ts:
-                    metrics["sys_time"] = ts
-
-        if metrics.get("exp_lim_default_w") is None:
-            dpos = window.find(b'"defaultControl"')
-            if dpos >= 0:
-                hi = window.find(b"}", dpos)
-                if hi > dpos:
-                    v = _extract_number_after(window[dpos:hi + 1], b'"opModExpLimW"')
-                    if v is not None:
-                        metrics["exp_lim_default_w"] = v
-
-        if metrics.get("exp_lim_active_w") is None:
-            apos = window.find(b'"activeControls"')
-            if apos >= 0:
-                hi = window.find(b"}", apos)
-                if hi > apos:
-                    v = _extract_number_after(window[apos:hi + 1], b'"opModExpLimW"')
-                    if v is not None:
-                        metrics["exp_lim_active_w"] = v
-
-        for loc_tok, mkey in meter_keys:
-            if metrics[mkey] is None:
-                pos = window.find(loc_tok)
-                if pos >= 0:
-                    lo = window.rfind(b"{", 0, pos)
-                    hi = window.find(b"}", pos)
-                    if lo >= 0 and hi > pos:
-                        v = _extract_number_after(
-                            window[lo:hi + 1], b'"realPowerW"'
-                        )
+                    m["sys_time"] = ts
+        for ktok, dkey in ((b'"defaultControl"', "exp_lim_default_w"), (b'"activeControls"', "exp_lim_active_w")):
+            if m.get(dkey) is None:
+                p = w.find(ktok)
+                if p >= 0:
+                    hi = w.find(b"}", p)
+                    if hi > p:
+                        v = _extract_num(w[p:hi + 1], b'"opModExpLimW"')
                         if v is not None:
-                            metrics[mkey] = v
-
+                            m[dkey] = v
+        for tok, mk in meters:
+            if m[mk] is None:
+                p = w.find(tok)
+                if p >= 0:
+                    lo = w.rfind(b"{", 0, p)
+                    hi = w.find(b"}", p)
+                    if lo >= 0 and hi > p:
+                        v = _extract_num(w[lo:hi + 1], b'"realPowerW"')
+                        if v is not None:
+                            m[mk] = v
         if not chunk:
             break
-        if len(window) > 320:
-            window = window[-320:]
+        if len(w) > 320:
+            w = w[-320:]
 
 
-_STRING_LETTERS = ("A", "B", "C", "D", "E", "F")
-
-_COMP_NUM_SIGNALS = {
-    "HVP_PackTempMin": ("pack_temp_min", "min"),
-    "HVP_PackTempMax": ("pack_temp_max", "max"),
-    "HVP_ShuntTemperature": ("shunt_temp", "max"),
-    "BMS_LOG_tempOutOfBounds": ("temp_oob", "sum"),
-    "BMS_LOG_tempOutOfBoundsCharge": ("temp_oob_chg", "sum"),
-    "PCH_AmbientTemp": ("inv_ambient_temp", "set"),
-    "PCH_FanSpeed_A": ("fan_rpm_a", "set"),
-    "PCH_FanSpeed_B": ("fan_rpm_b", "set"),
-    "PCH_FanDuty_A": ("fan_duty_a", "set"),
-    "PCH_FanDuty_B": ("fan_duty_b", "set"),
-    "BAGGR_NumBatteriesConnected": ("batt_connected", "set"),
-    "BAGGR_NumBatteriesExpected": ("batt_expected", "set"),
-    "PCH_AcVoltageAB": ("ac_v_ab", "set"),
-    "PCH_AcVoltageAN": ("ac_v_an", "set"),
-    "PCH_AcVoltageBN": ("ac_v_bn", "set"),
-    "PCH_AcFrequency": ("ac_freq", "set"),
-    "PCH_AcRealPowerAB": ("ac_power_w", "set"),
-    "PCH_BatteryPower": ("pch_batt_w", "set"),
-    "PCH_SlowPvPowerSum": ("slow_pv_sum_w", "set"),
-}
-
-_COMP_TEXT_SIGNALS = {
-    "HVP_State": "hvp_state",
-    "BAGGR_State": "baggr_state",
-    "PCH_AcMode": "ac_mode",
-    "PCH_State": "pch_state",
-    "PWS_RSD_State": "rsd_state",
-    "PWS_ProdSwitch_State": "prod_switch",
-    "PWS_SelfTest": "self_test",
-}
-
-
-def _new_components_dict():
-    return {
-        "strings": [
-            {"id": ch, "state": None, "v": None, "i": None, "w": 0.0}
-            for ch in _STRING_LETTERS
-        ],
-        "strings_dc_w": 0.0,
-        "slow_pv_sum_w": None,
-        "pack_temp_min": None,
-        "pack_temp_max": None,
-        "shunt_temp": None,
-        "temp_oob": None,
-        "temp_oob_chg": None,
-        "inv_ambient_temp": None,
-        "fan_rpm_a": None,
-        "fan_rpm_b": None,
-        "fan_duty_a": None,
-        "fan_duty_b": None,
-        "hvp_state": None,
-        "baggr_state": None,
-        "batt_connected": None,
-        "batt_expected": None,
-        "ac_v_ab": None,
-        "ac_v_an": None,
-        "ac_v_bn": None,
-        "ac_freq": None,
-        "ac_mode": None,
-        "pch_state": None,
-        "ac_power_w": None,
-        "pch_batt_w": None,
-        "rsd_state": None,
-        "prod_switch": None,
-        "self_test": None,
-        "alerts": [],
-        "_seen_signals": 0,
-    }
-
-
-_INTERN_STR = {
+_LETTERS = ("A", "B", "C", "D", "E", "F")
+_INTERN = {
     "Pv_Active": "Pv_Active",
     "Pv_Standby": "Pv_Standby",
     "Pv_Active_Parallel": "Pv_Active_Parallel",
 }
+_COMP_NUM = {
+    "HVP_PackTempMin": ("pack_temp_min", 1),   # 1=min
+    "HVP_PackTempMax": ("pack_temp_max", 2),   # 2=max
+    "HVP_ShuntTemperature": ("shunt_temp", 2),
+    "BMS_LOG_tempOutOfBounds": ("temp_oob", 3),        # 3=sum
+    "BMS_LOG_tempOutOfBoundsCharge": ("temp_oob_chg", 3),
+    "PCH_AmbientTemp": ("inv_ambient_temp", 0),        # 0=set
+    "PCH_FanSpeed_A": ("fan_rpm_a", 0),
+    "PCH_FanSpeed_B": ("fan_rpm_b", 0),
+    "PCH_FanDuty_A": ("fan_duty_a", 0),
+    "PCH_FanDuty_B": ("fan_duty_b", 0),
+    "PCH_AcVoltageAB": ("ac_v_ab", 0),
+    "PCH_AcVoltageAN": ("ac_v_an", 0),
+    "PCH_AcVoltageBN": ("ac_v_bn", 0),
+    "PCH_AcFrequency": ("ac_freq", 0),
+    "PCH_AcRealPowerAB": ("ac_power_w", 0),
+    "PCH_BatteryPower": ("pch_batt_w", 0),
+    "PCH_SlowPvPowerSum": ("slow_pv_sum_w", 0),
+}
+_COMP_TXT = {
+    "HVP_State": "hvp_state",
+    "PCH_AcMode": "ac_mode",
+    "PCH_State": "pch_state",
+}
 
 
-def _intern_or_copy(s):
-    if s is None:
-        return None
-    cached = _INTERN_STR.get(s)
-    if cached is not None:
-        return cached
-    return s.encode("utf-8").decode("utf-8")
-
-
-def _compact_num(v):
-    if v is None:
-        return None
-    return v + 0.0
-
-
-def _compact_components(tmp):
-    """
-    Re-pack extracted component values AFTER TLS and DeflateIO are closed & GC'd.
-    Prevents small strings/floats allocated above the 32 KB DeflateIO watermark
-    from pinning and fragmenting RP2040's non-compacting heap.
-    """
-    out = {
-        "strings": [
-            {
-                "id": srec["id"],
-                "state": _intern_or_copy(srec["state"]),
-                "v": _compact_num(srec["v"]),
-                "i": _compact_num(srec["i"]),
-                "w": _compact_num(srec["w"]),
-            }
-            for srec in tmp["strings"]
-        ],
-        "strings_dc_w": _compact_num(tmp["strings_dc_w"]),
-        "slow_pv_sum_w": _compact_num(tmp["slow_pv_sum_w"]),
-        "pack_temp_min": _compact_num(tmp["pack_temp_min"]),
-        "pack_temp_max": _compact_num(tmp["pack_temp_max"]),
-        "shunt_temp": _compact_num(tmp["shunt_temp"]),
-        "temp_oob": _compact_num(tmp["temp_oob"]),
-        "temp_oob_chg": _compact_num(tmp["temp_oob_chg"]),
-        "inv_ambient_temp": _compact_num(tmp["inv_ambient_temp"]),
-        "fan_rpm_a": _compact_num(tmp["fan_rpm_a"]),
-        "fan_rpm_b": _compact_num(tmp["fan_rpm_b"]),
-        "fan_duty_a": _compact_num(tmp["fan_duty_a"]),
-        "fan_duty_b": _compact_num(tmp["fan_duty_b"]),
-        "hvp_state": _intern_or_copy(tmp["hvp_state"]),
-        "baggr_state": _intern_or_copy(tmp["baggr_state"]),
-        "batt_connected": _compact_num(tmp["batt_connected"]),
-        "batt_expected": _compact_num(tmp["batt_expected"]),
-        "ac_v_ab": _compact_num(tmp["ac_v_ab"]),
-        "ac_v_an": _compact_num(tmp["ac_v_an"]),
-        "ac_v_bn": _compact_num(tmp["ac_v_bn"]),
-        "ac_freq": _compact_num(tmp["ac_freq"]),
-        "ac_mode": _intern_or_copy(tmp["ac_mode"]),
-        "pch_state": _intern_or_copy(tmp["pch_state"]),
-        "ac_power_w": _compact_num(tmp["ac_power_w"]),
-        "pch_batt_w": _compact_num(tmp["pch_batt_w"]),
-        "rsd_state": _intern_or_copy(tmp["rsd_state"]),
-        "prod_switch": _intern_or_copy(tmp["prod_switch"]),
-        "self_test": _intern_or_copy(tmp["self_test"]),
-        "time_str": _intern_or_copy(tmp.get("time_str")),
+def _new_components_dict():
+    d = {
+        "strings": [{"id": c, "state": None, "v": None, "i": None, "w": 0.0} for c in _LETTERS],
+        "strings_dc_w": 0.0,
+        "_seen_signals": 0,
     }
-    return out
+    for k, _ in _COMP_NUM.values():
+        d[k] = None
+    for k in _COMP_TXT.values():
+        d[k] = None
+    return d
 
 
-def _apply_component_object(obj, comp):
-    name = _extract_string_after(obj, b'"name"')
+def _repack(v):
+    """Clone scalars/containers into the bottom of heap after TLS/DeflateIO GC."""
+    if v is None or isinstance(v, bool):
+        return v
+    if isinstance(v, float):
+        return v + 0.0
+    if isinstance(v, str):
+        return _INTERN.get(v) or v.encode("utf-8").decode("utf-8")
+    if isinstance(v, list):
+        return [_repack(x) for x in v]
+    if isinstance(v, dict):
+        return {k: _repack(val) for k, val in v.items() if k != "_seen_signals"}
+    return v
+
+
+def _apply_comp_obj(obj, comp):
+    name = _extract_str(obj, b'"name"')
     if not name:
         return
-
-    # PV strings A..F: PCH_PvVoltageA..F, PCH_PvCurrentA..F, PCH_PvState_A..F
     if name.startswith("PCH_Pv"):
         comp["_seen_signals"] += 1
-        last = name[-1]
-        if last in _STRING_LETTERS:
-            srec = comp["strings"][ord(last) - 65]
+        ch = name[-1]
+        if ch in _LETTERS:
+            sr = comp["strings"][ord(ch) - 65]
             if name.startswith("PCH_PvVoltage"):
-                v = _extract_number_after(obj, b'"value"')
+                v = _extract_num(obj, b'"value"')
                 if v is not None:
-                    srec["v"] = v if v > 0.0 else 0.0
-                return
-            if name.startswith("PCH_PvCurrent"):
-                v = _extract_number_after(obj, b'"value"')
+                    sr["v"] = v if v > 0.0 else 0.0
+            elif name.startswith("PCH_PvCurrent"):
+                v = _extract_num(obj, b'"value"')
                 if v is not None:
-                    srec["i"] = v if v > 0.0 else 0.0
-                return
-            if name.startswith("PCH_PvState_"):
-                tv = _extract_string_after(obj, b'"textValue"')
+                    sr["i"] = v if v > 0.0 else 0.0
+            elif name.startswith("PCH_PvState_"):
+                tv = _extract_str(obj, b'"textValue"')
                 if tv is not None:
-                    srec["state"] = _INTERN_STR.get(tv, tv)
-                return
-
-    num_spec = _COMP_NUM_SIGNALS.get(name)
-    if num_spec is not None:
+                    sr["state"] = _INTERN.get(tv, tv)
+        return
+    ns = _COMP_NUM.get(name)
+    if ns is not None:
         comp["_seen_signals"] += 1
-        dest_key, mode = num_spec
-        v = _extract_number_after(obj, b'"value"')
+        dk, mode = ns
+        v = _extract_num(obj, b'"value"')
         if v is not None:
-            cur = comp[dest_key]
-            if cur is None or mode == "set":
-                comp[dest_key] = v
-            elif mode == "min" and v < cur:
-                comp[dest_key] = v
-            elif mode == "max" and v > cur:
-                comp[dest_key] = v
-            elif mode == "sum":
-                comp[dest_key] = cur + v
+            cur = comp[dk]
+            if cur is None or mode == 0:
+                comp[dk] = v
+            elif mode == 1 and v < cur:
+                comp[dk] = v
+            elif mode == 2 and v > cur:
+                comp[dk] = v
+            elif mode == 3:
+                comp[dk] = cur + v
         return
-
-    text_key = _COMP_TEXT_SIGNALS.get(name)
-    if text_key is not None:
+    tk = _COMP_TXT.get(name)
+    if tk is not None:
         comp["_seen_signals"] += 1
-        tv = _extract_string_after(obj, b'"textValue"')
-        if tv is not None and comp[text_key] is None:
-            comp[text_key] = tv
-        return
+        tv = _extract_str(obj, b'"textValue"')
+        if tv is not None and comp[tk] is None:
+            comp[tk] = tv
 
 
 def _scan_stream_for_components(reader, comp, chunk_size=512, wdt_feed=None):
-    """
-    O(1)-RAM streaming scanner for TEDAPI ComponentsQuery responses.
-    Processes each leaf JSON object `{...}` once as its closing brace arrives.
-    """
-    window = b""
+    w = b""
     while True:
         if wdt_feed:
             wdt_feed()
         chunk = reader.read(chunk_size)
         if chunk:
-            window += chunk
-
+            w += chunk
         pos = 0
         while True:
-            hi = window.find(b"}", pos)
+            hi = w.find(b"}", pos)
             if hi < 0:
                 break
-            lo = window.rfind(b"{", pos, hi)
+            lo = w.rfind(b"{", pos, hi)
             if lo >= 0:
-                _apply_component_object(window[lo:hi + 1], comp)
+                _apply_comp_obj(w[lo:hi + 1], comp)
             pos = hi + 1
-
         if pos > 0:
-            window = window[pos:]
+            w = w[pos:]
         if not chunk:
             break
-        if len(window) > 384:
-            last_open = window.rfind(b"{")
-            if last_open >= 0 and len(window) - last_open <= 384:
-                window = window[last_open:]
-            else:
-                window = window[-384:]
+        if len(w) > 384:
+            lo = w.rfind(b"{")
+            w = w[lo:] if (lo >= 0 and len(w) - lo <= 384) else w[-384:]
 
 
-def _scan_gzip_bytes(gz_bytes, target, scanner_fn=_scan_stream_for_metrics, wdt_feed=None):
-    """Decompress & stream-scan a gzipped TEDAPI response AFTER TLS is closed."""
+def _scan_gzip_bytes(gz_buf, target, scanner_fn=_scan_stream_for_metrics, wdt_feed=None):
     if deflate is not None:
-        bio = io.BytesIO(gz_bytes)
-        dstream = deflate.DeflateIO(bio, deflate.GZIP)
+        bio = io.BytesIO(gz_buf)
+        ds = deflate.DeflateIO(bio, deflate.GZIP)
         try:
-            scanner_fn(dstream, target, chunk_size=512, wdt_feed=wdt_feed)
+            scanner_fn(ds, target, chunk_size=512, wdt_feed=wdt_feed)
         finally:
             try:
-                dstream.close()
+                ds.close()
             except Exception:
                 pass
-            dstream = None
+            ds = None
             bio = None
     elif zlib is not None:
-        raw = zlib.decompress(gz_bytes, 16 + zlib.MAX_WBITS)
+        raw = zlib.decompress(bytes(gz_buf), 16 + zlib.MAX_WBITS)
         scanner_fn(io.BytesIO(raw), target, chunk_size=1024, wdt_feed=wdt_feed)
     else:
-        raise PowerwallError("Gzip response but no deflate module")
+        raise PowerwallError("No deflate module")
 
 
 def scale_soc_to_app(raw_soc):
-    """Convert Powerwall 3 raw physical SoC to Tesla App user-facing SoC."""
-    scaled = (raw_soc - 5.0) / 0.95
-    if scaled < 0.0:
-        return 0.0
-    if scaled > 100.0:
-        return 100.0
-    return scaled
+    s = (raw_soc - 5.0) / 0.95
+    return 0.0 if s < 0.0 else (100.0 if s > 100.0 else s)
 
 
-# --- Powerwall 3 TEDAPI Client ---
+_KEEP_HDRS = ("date", "content-length", "content-encoding", "transfer-encoding")
+
 
 class Powerwall3Client:
     def __init__(
@@ -699,9 +522,10 @@ class Powerwall3Client:
         host="192.168.91.1",
         port=443,
         gw_password="",
-        timeout_s=6,
+        timeout_s=12,
         soc_scale_to_app=True,
         utc_offset_hours=0,
+        payload_file="",
         graphql_payload=b"",
         query_text=b"",
         query_sig=b"",
@@ -726,53 +550,52 @@ class Powerwall3Client:
         self.components_query_text = components_query_text
         self.components_query_sig = components_query_sig
         self.components_query_vars = components_query_vars
+        self._gql_slice = None
+        self._comp_slice = None
+        self._load_payload_index(payload_file)
 
         self._din = None
-        self._ssl_ctx = _make_ssl_ctx()
-        raw_cred = ("Tesla_Energy_Device:" + gw_password).encode("utf-8")
-        b64 = binascii.b2a_base64(raw_cred).strip().decode("ascii")
-        self._basic_hdr = "Basic " + b64
+        cred = ("Tesla_Energy_Device:" + gw_password).encode("utf-8")
+        self._basic_hdr = "Basic " + binascii.b2a_base64(cred).strip().decode("ascii")
+
+    def _load_payload_index(self, path):
+        if not path:
+            return
+        try:
+            with open(path, "rb") as f:
+                hdr = f.read(4)
+            if len(hdr) == 4:
+                gl = (hdr[0] << 8) | hdr[1]
+                cl = (hdr[2] << 8) | hdr[3]
+                if gl > 0:
+                    self._gql_slice = (path, 4, gl)
+                if cl > 0:
+                    self._comp_slice = (path, 4 + gl, cl)
+        except OSError:
+            pass
 
     def _https_request(
-        self,
-        method,
-        path,
-        content_type=None,
-        body=b"",
-        body_parts=None,
-        metrics=None,
-        scanner_fn=None,
-        wdt_feed=None,
+        self, method, path, content_type=None, body_parts=None,
+        metrics=None, scanner_fn=None, wdt_feed=None,
     ):
-        """
-        Execute one HTTPS/1.1 request with strict socket/TLS cleanup.
-        If metrics target dict is provided:
-          - Uncompressed response is stream-scanned inline via scanner_fn.
-          - Gzipped response is buffered (~2-6 KB), TLS is closed & GC'd FIRST
-            (with all socket/reader references cleared), then decompressed in a
-            separate peak-memory phase for RP2040 safety.
-        """
         gc.collect()
         if wdt_feed:
             wdt_feed()
-
         if scanner_fn is None:
             scanner_fn = _scan_stream_for_metrics
 
         raw_sock = None
         tls_sock = None
         reader = None
-        resp_headers = {}
+        hdrs = {}
         gz_buf = None
         small_body = b""
         phase = "connect"
 
-        if body_parts is not None:
-            body_len = 0
-            for part in body_parts:
-                body_len += len(part)
-        else:
-            body_len = len(body) if body else 0
+        body_len = 0
+        if body_parts:
+            for p in body_parts:
+                body_len += p[2] if isinstance(p, tuple) else len(p)
 
         try:
             addr = socket.getaddrinfo(self.host, self.port)[0][-1]
@@ -783,45 +606,42 @@ class Powerwall3Client:
                 wdt_feed()
 
             phase = "tls"
-            tls_sock = _wrap_tls(raw_sock, self.host, ctx=self._ssl_ctx)
+            tls_sock = _wrap_tls(raw_sock, self.host)
             if wdt_feed:
                 wdt_feed()
 
             phase = "send"
-            req_lines = [
+            rl = [
                 "{} {} HTTP/1.1".format(method, path),
-                "Host: {}".format(self.host),
-                "Authorization: {}".format(self._basic_hdr),
+                "Host: " + self.host,
+                "Authorization: " + self._basic_hdr,
                 "Accept: */*",
                 "Accept-Encoding: identity",
                 "Connection: close",
             ]
             if content_type:
-                req_lines.append("Content-Type: {}".format(content_type))
+                rl.append("Content-Type: " + content_type)
             if body_len:
-                req_lines.append("Content-Length: {}".format(body_len))
-            req_head = ("\r\n".join(req_lines) + "\r\n\r\n").encode("ascii")
-
-            _send_all(tls_sock, req_head)
-            req_head = None
-            req_lines = None
-            if body_parts is not None:
-                for part in body_parts:
-                    if part:
-                        _send_all(tls_sock, part)
-            elif body:
-                _send_all(tls_sock, body)
+                rl.append("Content-Length: {}".format(body_len))
+            _send_all(tls_sock, ("\r\n".join(rl) + "\r\n\r\n").encode("ascii"))
+            rl = None
+            if body_parts:
+                for p in body_parts:
+                    if isinstance(p, tuple):
+                        _send_file_slice(tls_sock, p[0], p[1], p[2])
+                    elif p:
+                        _send_all(tls_sock, p)
             if wdt_feed:
                 wdt_feed()
 
             phase = "hdr"
-            status_line = _read_line(tls_sock)
-            if not status_line:
+            sline = _read_line(tls_sock)
+            if not sline:
                 raise PowerwallError("Empty HTTP response")
-            parts = status_line.split(None, 2)
-            if len(parts) < 2:
+            sp = sline.split(None, 2)
+            if len(sp) < 2:
                 raise PowerwallError("Bad HTTP status")
-            status = int(parts[1])
+            status = int(sp[1])
 
             while True:
                 line = _read_line(tls_sock)
@@ -829,9 +649,9 @@ class Powerwall3Client:
                     break
                 if b":" in line:
                     k, v = line.split(b":", 1)
-                    resp_headers[k.strip().lower().decode("ascii", "ignore")] = (
-                        v.strip().decode("ascii", "ignore")
-                    )
+                    ks = k.strip().lower().decode("ascii", "ignore")
+                    if ks in _KEEP_HDRS:
+                        hdrs[ks] = v.strip().decode("ascii", "ignore")
 
             if status in (429, 503):
                 raise RateLimitError("HTTP {}".format(status))
@@ -841,16 +661,14 @@ class Powerwall3Client:
                 raise PowerwallError("HTTP {}".format(status))
 
             phase = "body"
-            te = resp_headers.get("transfer-encoding", "").lower()
-            ce = resp_headers.get("content-encoding", "").lower()
-            cl_str = resp_headers.get("content-length")
-            cl = int(cl_str) if cl_str and cl_str.isdigit() else None
-
+            te = hdrs.get("transfer-encoding", "").lower()
+            ce = hdrs.get("content-encoding", "").lower()
+            cls = hdrs.get("content-length")
+            cl = int(cls) if cls and cls.isdigit() else None
             reader = _ChunkedReader(tls_sock) if "chunked" in te else _LengthReader(tls_sock, cl)
 
             if metrics is not None:
                 if "gzip" in ce:
-                    # Pre-allocate exact buffer when Content-Length is known (zero doubling fragmentation)
                     if cl is not None and 0 < cl <= 24576:
                         gz_buf = bytearray(cl)
                         mv = memoryview(gz_buf)
@@ -858,8 +676,7 @@ class Powerwall3Client:
                         while got < cl:
                             if wdt_feed:
                                 wdt_feed()
-                            want = 512 if (cl - got) > 512 else (cl - got)
-                            c = reader.read(want)
+                            c = reader.read(512 if (cl - got) > 512 else (cl - got))
                             if not c:
                                 break
                             n = len(c)
@@ -886,14 +703,11 @@ class Powerwall3Client:
                     try:
                         scanner_fn(reader, metrics, chunk_size=512, wdt_feed=wdt_feed)
                     except OSError:
-                        has_partial = (
-                            cl is None
-                            and (
-                                (metrics.get("remaining_wh") is not None and metrics.get("full_wh"))
-                                or metrics.get("_seen_signals", 0) > 0
-                            )
+                        ok = cl is None and (
+                            (metrics.get("remaining_wh") is not None and metrics.get("full_wh"))
+                            or metrics.get("_seen_signals", 0) > 0
                         )
-                        if not has_partial:
+                        if not ok:
                             raise
             else:
                 buf = bytearray()
@@ -908,7 +722,7 @@ class Powerwall3Client:
                         break
                     buf.extend(c)
                 small_body = bytes(buf)
-        except OSError as e:
+        except (OSError, MemoryError) as e:
             raise PowerwallError("{}@{}: {}".format(phase, path, e))
         finally:
             reader = None
@@ -926,7 +740,6 @@ class Powerwall3Client:
                 raw_sock = None
             gc.collect()
 
-        # Phase 2 (TLS RAM already freed!): decompress gzip directly from gz_buf (no copy!)
         if gz_buf is not None:
             phase = "gzip"
             try:
@@ -937,7 +750,7 @@ class Powerwall3Client:
                 gz_buf = None
                 gc.collect()
 
-        return resp_headers, small_body
+        return hdrs, small_body
 
     def _ensure_din(self, wdt_feed=None):
         if self._din:
@@ -945,137 +758,86 @@ class Powerwall3Client:
         _, body = self._https_request("GET", "/tedapi/din", wdt_feed=wdt_feed)
         din = body.decode("utf-8", "ignore").strip()
         if not din:
-            raise PowerwallError("Empty DIN from /tedapi/din")
+            raise PowerwallError("Empty DIN")
         self._din = din
         return din
 
     def poll(self, wdt_feed=None):
         if self.host == "192.168.91.1" and not self.is_real_signed_query:
-            raise PowerwallError("Run export_tedapi_query.py first")
+            raise PowerwallError("Run export_tedapi_query.py")
+        if self.host == "192.168.91.1" and not (self._gql_slice or self.graphql_payload):
+            raise PowerwallError("Upload tedapi.bin")
 
         din = self._ensure_din(wdt_feed=wdt_feed)
-        req_parts = build_tedapi_query_parts(
-            din,
-            query_text=self.query_text,
-            query_sig=self.query_sig,
-            variables_json=self.query_vars,
-            graphql_payload=self.graphql_payload,
+        parts = build_tedapi_query_parts(
+            din, self.query_text, self.query_sig, self.query_vars,
+            self.graphql_payload, self._gql_slice,
         )
-        metrics = {
-            "remaining_wh": None,
-            "full_wh": None,
-            "soc_raw": None,
-            "soc_pct": None,
-            "batt_w": None,
-            "solar_w": None,
-            "load_w": None,
-            "site_w": None,
-            "grid_ok": None,
-            "site_shutdown": None,
-            "exp_lim_default_w": None,
-            "exp_lim_active_w": None,
-            "exp_lim_w": None,
-            "sys_time": None,
-            "time_str": None,
+        m = {
+            "remaining_wh": None, "full_wh": None, "batt_w": None, "solar_w": None,
+            "load_w": None, "site_w": None, "grid_ok": None, "site_shutdown": None,
+            "exp_lim_default_w": None, "exp_lim_active_w": None, "sys_time": None,
         }
-        resp_hdrs, _ = self._https_request(
-            "POST",
-            "/tedapi/v1",
-            content_type="application/octet-stream",
-            body_parts=req_parts,
-            metrics=metrics,
-            scanner_fn=_scan_stream_for_metrics,
-            wdt_feed=wdt_feed,
+        hdrs, _ = self._https_request(
+            "POST", "/tedapi/v1", "application/octet-stream",
+            body_parts=parts, metrics=m, scanner_fn=_scan_stream_for_metrics, wdt_feed=wdt_feed,
         )
-        req_parts = None
-        gc.collect()
-
-        rem = metrics["remaining_wh"]
-        full = metrics["full_wh"]
+        parts = None
+        rem = m["remaining_wh"]
+        full = m["full_wh"]
         if rem is None or not full:
-            raise PowerwallError("Missing Wh fields in TEDAPI response")
+            m = None
+            gc.collect()
+            raise PowerwallError("Missing Wh fields")
 
         raw_soc = (rem / full) * 100.0
-        exp_lim = metrics["exp_lim_active_w"]
+        exp_lim = m["exp_lim_active_w"]
         if exp_lim is None:
-            exp_lim = metrics["exp_lim_default_w"]
-        t_str = (
-            _parse_iso_hhmm(metrics["sys_time"], self.utc_offset_hours)
-            or _parse_date_hhmm(resp_hdrs.get("date"), self.utc_offset_hours)
+            exp_lim = m["exp_lim_default_w"]
+        m["soc_raw"] = raw_soc
+        m["soc_pct"] = scale_soc_to_app(raw_soc) if self.soc_scale_to_app else raw_soc
+        m["exp_lim_w"] = exp_lim
+        m["time_str"] = (
+            _parse_iso_hhmm(m["sys_time"], self.utc_offset_hours)
+            or _parse_date_hhmm(hdrs.get("date"), self.utc_offset_hours)
         )
-        resp_hdrs = None
+        hdrs = None
         gc.collect()
-
-        # Re-pack into bottom of heap AFTER TLS & DeflateIO are freed
-        out = {
-            "remaining_wh": _compact_num(rem),
-            "full_wh": _compact_num(full),
-            "soc_raw": _compact_num(raw_soc),
-            "soc_pct": _compact_num(scale_soc_to_app(raw_soc) if self.soc_scale_to_app else raw_soc),
-            "batt_w": _compact_num(metrics["batt_w"]),
-            "solar_w": _compact_num(metrics["solar_w"]),
-            "load_w": _compact_num(metrics["load_w"]),
-            "site_w": _compact_num(metrics["site_w"]),
-            "grid_ok": metrics["grid_ok"],
-            "site_shutdown": metrics["site_shutdown"],
-            "exp_lim_w": _compact_num(exp_lim),
-            "sys_time": _intern_or_copy(metrics["sys_time"]),
-            "time_str": _intern_or_copy(t_str),
-        }
-        metrics = None
+        out = _repack(m)
+        m = None
         gc.collect()
         return out
 
     def poll_components(self, wdt_feed=None):
-        """
-        Poll Powerwall 3 ComponentsQuery (solar strings A-F, pack/inverter temps,
-        fan RPM/duty, AC grid voltage/frequency, and BMS over-temp counters).
-        Called on-demand only when displaying a detail view.
-        """
-        if self.host == "192.168.91.1" and not self.components_payload:
-            raise PowerwallError("Re-run export_tedapi_query.py")
+        if self.host == "192.168.91.1" and not (self._comp_slice or self.components_payload):
+            raise PowerwallError("Upload tedapi.bin")
 
         din = self._ensure_din(wdt_feed=wdt_feed)
-        req_parts = build_tedapi_query_parts(
-            din,
-            query_text=self.components_query_text,
-            query_sig=self.components_query_sig,
-            variables_json=self.components_query_vars,
-            graphql_payload=self.components_payload,
+        parts = build_tedapi_query_parts(
+            din, self.components_query_text, self.components_query_sig,
+            self.components_query_vars, self.components_payload, self._comp_slice,
         )
-        tmp_comp = _new_components_dict()
-        resp_hdrs, _ = self._https_request(
-            "POST",
-            "/tedapi/v1",
-            content_type="application/octet-stream",
-            body_parts=req_parts,
-            metrics=tmp_comp,
-            scanner_fn=_scan_stream_for_components,
-            wdt_feed=wdt_feed,
+        tmp = _new_components_dict()
+        hdrs, _ = self._https_request(
+            "POST", "/tedapi/v1", "application/octet-stream",
+            body_parts=parts, metrics=tmp, scanner_fn=_scan_stream_for_components, wdt_feed=wdt_feed,
         )
-        req_parts = None
-
-        if tmp_comp["_seen_signals"] == 0:
-            tmp_comp = None
+        parts = None
+        if tmp["_seen_signals"] == 0:
+            tmp = None
             gc.collect()
-            raise PowerwallError("No component signals in response")
+            raise PowerwallError("No component signals")
 
-        total_dc = 0.0
-        for srec in tmp_comp["strings"]:
-            v = srec["v"] or 0.0
-            i = srec["i"] or 0.0
-            w = v * i
-            srec["w"] = w
-            total_dc += w
-        tmp_comp["strings_dc_w"] = total_dc
-        tmp_comp["time_str"] = _parse_date_hhmm(
-            resp_hdrs.get("date"), self.utc_offset_hours
-        )
-        resp_hdrs = None
+        dc = 0.0
+        for sr in tmp["strings"]:
+            w = (sr["v"] or 0.0) * (sr["i"] or 0.0)
+            sr["w"] = w
+            dc += w
+        tmp["strings_dc_w"] = dc
+        tmp["time_str"] = _parse_date_hhmm(hdrs.get("date"), self.utc_offset_hours)
+        hdrs = None
         gc.collect()
-
-        # Re-pack into bottom of heap AFTER TLS & DeflateIO are freed
-        comp = _compact_components(tmp_comp)
-        tmp_comp = None
+        out = _repack(tmp)
+        tmp = None
         gc.collect()
-        return comp
+        return out
