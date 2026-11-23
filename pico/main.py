@@ -437,20 +437,25 @@ def draw_batt_detail():
         "A:{}({}) B:{}({})".format(fa_s, da_s, fb_s, db_s),
     )
 
-    bc = c["batt_connected"]
-    be = c["batt_expected"]
-    if bc is not None and be is not None:
-        pack_main = "{} / {} OK".format(int(bc), int(be))
-        pack_col = C_GREEN if int(bc) == int(be) else C_RED
-    elif bc is not None:
-        pack_main = "{} CONN".format(int(bc))
-        pack_col = C_GREEN
+    batt_dc = c["pch_batt_w"] if c["pch_batt_w"] is not None else latest["batt_w"]
+    if batt_dc is None:
+        batt_col = C_MUTED
+        bdir = "--"
+    elif batt_dc < -50.0:
+        batt_col = C_GREEN
+        bdir = "CHG"
+    elif batt_dc > 50.0:
+        batt_col = C_CYAN
+        bdir = "DIS"
     else:
-        pack_main = "-- PACKS"
-        pack_col = C_MUTED
+        batt_col = C_MUTED
+        bdir = "IDLE"
+    if c["slow_pv_sum_w"] is not None:
+        batt_sub = "{}  PV:{:.2f}kW".format(bdir, c["slow_pv_sum_w"] / 1000.0)
+    else:
+        batt_sub = "{}  ST:{}".format(bdir, _short_state(c["pch_state"], 11))
     _draw_detail_card(
-        165, 118, 145, 58, pack_col, "PACKS / BAGGR", pack_main,
-        "ST: " + _short_state(c["baggr_state"], 16),
+        165, 118, 145, 58, batt_col, "BATT DC PWR", fmt_kw(batt_dc), batt_sub,
     )
 
     free_kb = gc.mem_free() // 1024
@@ -491,12 +496,24 @@ def draw_grid_detail():
         "MODE: " + _short_state(c["ac_mode"], 14),
     )
 
-    rsd = _short_state(c["rsd_state"], 10)
-    sw = _short_state(c["prod_switch"], 8)
-    pch_st = _short_state(c["pch_state"], 8)
+    site_w = latest["site_w"]
+    if site_w is None:
+        grid_col = C_MUTED
+        gdir = "--"
+    elif site_w < -50.0:
+        grid_col = C_GREEN
+        gdir = "EXP"
+    elif site_w > 50.0:
+        grid_col = C_AMBER
+        gdir = "IMP"
+    else:
+        grid_col = C_CYAN
+        gdir = "IDLE"
+    load_w = latest["load_w"]
+    home_s = "{:.2f}kW".format(load_w / 1000.0) if load_w is not None else "--.-kW"
     _draw_detail_card(
-        165, 118, 145, 58, C_AMBER, "SAFETY / RSD", rsd,
-        "SW:{} P:{}".format(sw, pch_st),
+        165, 118, 145, 58, grid_col, "GRID FLOW", fmt_kw(site_w),
+        "{} HOME:{}".format(gdir, home_s),
     )
 
     _draw_alerts_bar(c["alerts"], "TEST: " + _short_state(c["self_test"], 16))
