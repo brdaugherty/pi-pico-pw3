@@ -64,7 +64,7 @@ def simulated_state(capacity_wh=13500.0):
     solar_w = round(max(0.0, 4200.0 * math.sin(t / 60.0 + 0.5)), 1)
     load_w = round(1450.0 + 400.0 * math.cos(t / 30.0), 1)
     batt_w = round(load_w - solar_w, 1)
-    site_w = round(25.0 * math.sin(t / 20.0), 1)
+    site_w = round(2400.0 * math.sin(t / 50.0), 1)
     return {
         "rem_wh": rem_wh,
         "full_wh": capacity_wh,
