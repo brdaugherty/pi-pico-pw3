@@ -45,6 +45,22 @@ C_CYAN_DIM = D.create_pen(0, 58, 74)
 led = RGBLED(26, 27, 28)
 led.set_rgb(0, 0, 0)
 btns = tuple(Pin(p, Pin.IN, Pin.PULL_UP) for p in (12, 13, 14, 15))
+_btn_q = 0
+_btn_db = [t_add(t_ms(), -500)] * 4
+
+
+def _mk_irq(i):
+    def _h(_p):
+        global _btn_q
+        now = t_ms()
+        if t_diff(now, _btn_db[i]) >= 180:
+            _btn_db[i] = now
+            _btn_q |= 1 << i
+    return _h
+
+
+for _i in range(4):
+    btns[_i].irq(trigger=Pin.IRQ_FALLING, handler=_mk_irq(_i))
 
 # 24h in-RAM ring buffers (288 x 5-min buckets, 5 series = 2.8 KB, zero flash wear)
 HIST_HOURS = getattr(cfg, "HISTORY_HOURS", 24)
@@ -73,7 +89,7 @@ latest = {
     "batt_w": None, "solar_w": None, "load_w": None, "site_w": None,
     "grid_ok": None, "site_shutdown": None, "exp_lim_w": None, "time_str": "--:--",
 }
-comp_data = comp_last_ms = cd_until = None
+comp_data = comp_last_ms = cd_until = comp_due = None
 comp_pending = status_is_err = False
 status_msg = "BOOTING PW3..."
 consec_err = 0
@@ -228,6 +244,8 @@ def _draw_series(arr, x0, y1, pw, ph, sdiv, mv, col, fill=None):
         r = max(0.0, min(1.0, (rv / sdiv) / mv))
         px = x0 + ((off + i) * pw) // den
         py = y1 - int(r * ph)
+        if px == xp and py == yp:
+            continue
         if fill is not None:
             if xp is not None and px > xp:
                 dx, dy = px - xp, py - yp
@@ -630,33 +648,36 @@ def main():
     gc.collect()
     print("Boot complete. Free RAM:", gc.mem_free(), "bytes")
 
-    prev = [1, 1, 1, 1]
     next_poll = t_ms()
     cfresh = min(15, cfg.POLL_INTERVAL_S) * 1000
 
     def _poll_btn(now):
-        global view_mode, bl_mode, last_input_ms, comp_pending
-        dirty = False
-        for i in range(4):
-            v = btns[i].value()
-            if prev[i] == 1 and v == 0:
-                last_input_ms = now
-                if bl_mode == BL_OFF and i != 3:
-                    bl_mode = BL_AUTO
-                elif i == 0:
-                    view_mode = VIEW_BATT_DETAIL if view_mode == VIEW_SOC else VIEW_SOC
-                elif i == 1:
-                    view_mode = VIEW_GRID_DETAIL if view_mode == VIEW_GRID else VIEW_GRID
-                elif i == 2:
-                    view_mode = VIEW_STRINGS_DETAIL if view_mode == VIEW_FLOW else VIEW_FLOW
-                else:
-                    bl_mode = (bl_mode + 1) % 3
-                comp_pending = is_detail_view() and (comp_last_ms is None or t_diff(now, comp_last_ms) >= cfresh)
-                dirty = True
-            prev[i] = v
-        update_backlight(now)
-        if dirty:
+        global view_mode, bl_mode, last_input_ms, comp_pending, comp_due, _btn_q
+        q = _btn_q
+        if q:
+            _btn_q = 0
+            for i in range(4):
+                if q & (1 << i):
+                    last_input_ms = now
+                    if bl_mode == BL_OFF and i != 3:
+                        bl_mode = BL_AUTO
+                    elif i == 0:
+                        view_mode = VIEW_BATT_DETAIL if view_mode == VIEW_SOC else VIEW_SOC
+                    elif i == 1:
+                        view_mode = VIEW_GRID_DETAIL if view_mode == VIEW_GRID else VIEW_GRID
+                    elif i == 2:
+                        view_mode = VIEW_STRINGS_DETAIL if view_mode == VIEW_FLOW else VIEW_FLOW
+                    else:
+                        bl_mode = (bl_mode + 1) % 3
+                    if is_detail_view() and (comp_last_ms is None or t_diff(now, comp_last_ms) >= cfresh):
+                        comp_pending, comp_due = True, t_add(now, 600)
+                    else:
+                        comp_pending = False
+            update_backlight(now)
             draw_ui()
+            return True
+        update_backlight(now)
+        return False
 
     def _run_vitals():
         global comp_data, comp_last_ms, comp_pending, cd_until, status_msg, status_is_err, consec_err
@@ -695,7 +716,7 @@ def main():
         now = t_ms()
         _poll_btn(now)
         in_cd = cd_until is not None and t_diff(cd_until, now) > 0
-        if comp_pending and is_detail_view() and not in_cd:
+        if comp_pending and is_detail_view() and not in_cd and (comp_due is None or t_diff(now, comp_due) >= 0):
             if ensure_wifi(wlan, wdt, _poll_btn):
                 status_msg, status_is_err = "POLLING VITALS...", False
                 draw_ui()
@@ -705,7 +726,8 @@ def main():
             else:
                 comp_pending = False
             update_led()
-            draw_ui()
+            if not _poll_btn(t_ms()):
+                draw_ui()
         if t_diff(now, next_poll) >= 0:
             if ensure_wifi(wlan, wdt, _poll_btn):
                 if status_msg == "BOOTING PW3..." or status_msg.startswith("WIFI "):
@@ -727,6 +749,7 @@ def main():
                     print("SOC={:.1f}% REM={:.2f}kWh BATT={}W SOLAR={}W EXPLIM={}W FREE={}B".format(
                         latest["soc_pct"], latest["remaining_wh"] / 1000.0,
                         latest["batt_w"], latest["solar_w"], latest["exp_lim_w"], gc.mem_free()))
+                    _poll_btn(t_ms())
                     if is_detail_view():
                         _run_vitals()
                         if cd_until is not None and t_diff(cd_until, t_ms()) > 0:
@@ -753,8 +776,9 @@ def main():
                 delay = 15000
             next_poll = t_add(t_ms(), delay)
             update_led()
-            draw_ui()
-        time.sleep_ms(50)
+            if not _poll_btn(t_ms()):
+                draw_ui()
+        time.sleep_ms(20)
 
 
 if __name__ == "__main__":
