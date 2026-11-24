@@ -1,7 +1,7 @@
 # pico/wifi_setup.py
-# On-demand SoftAP captive portal for configuring Powerwall 3 Wi-Fi credentials
-# without editing config.py. Imported ONLY when entering Setup (long-press Y or
-# unconfigured first boot) so it consumes 0 B RAM during normal dashboard operation.
+# On-demand SoftAP captive portal with dynamic QR code for configuring Powerwall 3
+# Wi-Fi credentials without editing config.py. Imported ONLY when entering Setup
+# (long-press Y or unconfigured first boot) so it uses 0 B RAM in normal operation.
 
 import gc
 import json
@@ -15,6 +15,276 @@ import machine
 AP_SSID = "PicoPW3-Setup"
 SETTINGS_FILE = "wifi.json"
 TIMEOUT_MS = 300000  # 5 min inactivity auto-exit
+_PW_ALPHA = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # 32 unambiguous chars
+
+# ISO/IEC 18004 Versions 1-4, ECC Level L (single RS block):
+# (size, data_cw, ec_cw, align_center)
+_QR_VER = (
+    (21, 19, 7, 0),
+    (25, 34, 10, 18),
+    (29, 55, 15, 22),
+    (33, 80, 20, 26),
+)
+
+
+def _gen_ap_pass():
+    raw = os.urandom(8)
+    return "".join(_PW_ALPHA[b & 31] for b in raw)
+
+
+def _qr_wifi_str(ssid, pw):
+    def _qesc(s):
+        return s.replace("\\", "\\\\").replace(";", "\\;").replace(":", "\\:").replace(",", "\\,")
+    return "WIFI:T:WPA;S:{};P:{};;".format(_qesc(ssid), _qesc(pw))
+
+
+def _rs_ec(data_cw, ec_len):
+    exp = [0] * 512
+    log = [0] * 256
+    v = 1
+    for i in range(255):
+        exp[i] = v
+        log[v] = i
+        v <<= 1
+        if v & 0x100:
+            v ^= 0x11D
+    for i in range(255, 512):
+        exp[i] = exp[i - 255]
+
+    gen = [1]
+    for i in range(ec_len):
+        ng = [0] * (len(gen) + 1)
+        g_i = exp[i]
+        for j, c in enumerate(gen):
+            ng[j] ^= c
+            if c:
+                ng[j + 1] ^= exp[log[c] + log[g_i]]
+        gen = ng
+
+    rem = list(data_cw) + [0] * ec_len
+    for i in range(len(data_cw)):
+        coef = rem[i]
+        if coef:
+            lc = log[coef]
+            for j in range(1, len(gen)):
+                if gen[j]:
+                    rem[i + j] ^= exp[log[gen[j]] + lc]
+    return rem[len(data_cw):]
+
+
+def _qr_fmt_bits(mask):
+    d = (1 << 3) | mask  # ECC-L = 01
+    r = d << 10
+    for i in range(4, -1, -1):
+        if r & (1 << (i + 10)):
+            r ^= 0x537 << i
+    return ((d << 10) | r) ^ 0x5412
+
+
+def _qr_mask_bit(m, r, c):
+    if m == 0:
+        return (r + c) % 2 == 0
+    if m == 1:
+        return r % 2 == 0
+    if m == 2:
+        return c % 3 == 0
+    if m == 3:
+        return (r + c) % 3 == 0
+    if m == 4:
+        return (r // 2 + c // 3) % 2 == 0
+    if m == 5:
+        return (r * c) % 2 + (r * c) % 3 == 0
+    if m == 6:
+        return ((r * c) % 2 + (r * c) % 3) % 2 == 0
+    return ((r + c) % 2 + (r * c) % 3) % 2 == 0
+
+
+def _qr_penalty(mat, n):
+    pen = 0
+    dark = 0
+    for r in range(n):
+        row = mat[r]
+        run_c = row[0]
+        run_l = 1
+        dark += run_c
+        for c in range(1, n):
+            v = row[c]
+            dark += v
+            if v == run_c:
+                run_l += 1
+                if run_l == 5:
+                    pen += 3
+                elif run_l > 5:
+                    pen += 1
+            else:
+                run_c = v
+                run_l = 1
+    for c in range(n):
+        run_c = mat[0][c]
+        run_l = 1
+        for r in range(1, n):
+            v = mat[r][c]
+            if v == run_c:
+                run_l += 1
+                if run_l == 5:
+                    pen += 3
+                elif run_l > 5:
+                    pen += 1
+            else:
+                run_c = v
+                run_l = 1
+    for r in range(n - 1):
+        r0, r1 = mat[r], mat[r + 1]
+        for c in range(n - 1):
+            v = r0[c]
+            if v == r0[c + 1] == r1[c] == r1[c + 1]:
+                pen += 3
+    pct = (dark * 100) // (n * n)
+    pen += (abs(pct - 50) // 5) * 10
+    return pen
+
+
+def _encode_qr_py(text):
+    raw = text.encode("utf-8") if isinstance(text, str) else text
+    blen = len(raw)
+    ver = None
+    for v in _QR_VER:
+        if blen <= v[1] - 2:
+            ver = v
+            break
+    if ver is None:
+        raise ValueError("QR text too long")
+    n, dcw, ecw, ap = ver
+
+    # Build Byte-mode bitstream
+    bits = []
+    def _push(val, nb):
+        for sh in range(nb - 1, -1, -1):
+            bits.append((val >> sh) & 1)
+    _push(0b0100, 4)
+    _push(blen, 8)
+    for b in raw:
+        _push(b, 8)
+    cap = dcw * 8
+    _push(0, min(4, cap - len(bits)))
+    while len(bits) & 7:
+        bits.append(0)
+    cw = []
+    for i in range(0, len(bits), 8):
+        v = 0
+        for b in bits[i : i + 8]:
+            v = (v << 1) | b
+        cw.append(v)
+    pad = (0xEC, 0x11)
+    pi = 0
+    while len(cw) < dcw:
+        cw.append(pad[pi])
+        pi ^= 1
+    all_cw = cw + _rs_ec(cw, ecw)
+
+    # Function patterns
+    mat = [[0] * n for _ in range(n)]
+    fn = [[0] * n for _ in range(n)]
+
+    def _set_fn(r, c, v):
+        if 0 <= r < n and 0 <= c < n:
+            mat[r][c] = v
+            fn[r][c] = 1
+
+    for fr, fc in ((0, 0), (0, n - 7), (n - 7, 0)):
+        for dr in range(-1, 8):
+            for dc in range(-1, 8):
+                v = 1 if (0 <= dr <= 6 and 0 <= dc <= 6 and (
+                    dr in (0, 6) or dc in (0, 6) or (2 <= dr <= 4 and 2 <= dc <= 4)
+                )) else 0
+                _set_fn(fr + dr, fc + dc, v)
+
+    for i in range(8, n - 8):
+        v = 1 if (i & 1) == 0 else 0
+        _set_fn(6, i, v)
+        _set_fn(i, 6, v)
+
+    if ap:
+        for dr in range(-2, 3):
+            for dc in range(-2, 3):
+                v = 1 if (max(abs(dr), abs(dc)) != 1) else 0
+                _set_fn(ap + dr, ap + dc, v)
+
+    _set_fn(n - 8, 8, 1)  # Dark module
+
+    # Reserve format info cells
+    for i in range(9):
+        if i != 6:
+            fn[8][i] = 1
+            fn[i][8] = 1
+    for i in range(n - 8, n):
+        fn[8][i] = 1
+    for i in range(n - 7, n):
+        fn[i][8] = 1
+
+    # Place data + EC bits in zigzag
+    bi = 0
+    tot_bits = len(all_cw) * 8
+    up = True
+    col = n - 1
+    while col > 0:
+        if col == 6:
+            col -= 1
+        rows = range(n - 1, -1, -1) if up else range(n)
+        for r in rows:
+            for dc in (0, -1):
+                c = col + dc
+                if not fn[r][c]:
+                    if bi < tot_bits:
+                        mat[r][c] = (all_cw[bi >> 3] >> (7 - (bi & 7))) & 1
+                        bi += 1
+        col -= 2
+        up = not up
+
+    def _apply_fmt(m_arr, mask):
+        fb = _qr_fmt_bits(mask)
+        # Bit 14..0
+        b = [(fb >> (14 - k)) & 1 for k in range(15)]
+        # Top-left horizontal & vertical
+        c_pos = (0, 1, 2, 3, 4, 5, 7, 8)
+        for k, c in enumerate(c_pos):
+            m_arr[8][c] = b[k]
+        r_pos = (7, 5, 4, 3, 2, 1, 0)
+        for k, r in enumerate(r_pos):
+            m_arr[r][8] = b[8 + k]
+        # Bottom-left vertical (bits 14..8 -> b[0..6])
+        for k in range(7):
+            m_arr[n - 1 - k][8] = b[k]
+        # Top-right horizontal (bits 7..0 -> b[7..14])
+        for k in range(8):
+            m_arr[8][n - 8 + k] = b[7 + k]
+
+    # Pick lowest-penalty mask
+    best_m = None
+    best_p = 1 << 30
+    for mask in range(8):
+        cand = [
+            [mat[r][c] ^ (1 if (not fn[r][c] and _qr_mask_bit(mask, r, c)) else 0) for c in range(n)]
+            for r in range(n)
+        ]
+        _apply_fmt(cand, mask)
+        p = _qr_penalty(cand, n)
+        if p < best_p:
+            best_p = p
+            best_m = cand
+    return n, best_m
+
+
+def encode_qr(text):
+    """Return (size, 2D matrix of 0/1). Uses built-in C qrcode if present, else pure-Python."""
+    try:
+        import qrcode
+        qr = qrcode.QRCode()
+        qr.set_text(text)
+        w, h = qr.get_size()
+        return w, [[1 if qr.get_module(x, y) else 0 for x in range(w)] for y in range(h)]
+    except Exception:
+        return _encode_qr_py(text)
 
 
 def _esc(s):
@@ -122,16 +392,14 @@ def _scan_aps(wdt=None):
         is_pw = s.startswith("TeslaPW_") or s.startswith("TEG-")
         return (0 if is_pw else 1, -rssi)
 
-    aps = sorted(best.items(), key=_sort_key)
-    return aps[:15]
+    return sorted(best.items(), key=_sort_key)[:15]
 
 
-def _start_ap(wdt=None):
+def _start_ap(ap_pw, wdt=None):
     ap = network.WLAN(network.AP_IF)
     for kw in (
-        {"essid": AP_SSID, "security": 0},
-        {"essid": AP_SSID, "authmode": 0},
-        {"ssid": AP_SSID, "security": 0},
+        {"essid": AP_SSID, "password": ap_pw},
+        {"ssid": AP_SSID, "password": ap_pw},
     ):
         try:
             ap.config(**kw)
@@ -154,12 +422,10 @@ def _start_ap(wdt=None):
 def _build_dns_reply(pkt, ip_bytes):
     if len(pkt) < 12:
         return None
-    # Walk QNAME from offset 12
-    idx = 12
-    n = len(pkt)
+    idx, n = 12, len(pkt)
     while idx < n and pkt[idx] != 0:
         idx += 1 + pkt[idx]
-    q_end = idx + 5  # null byte + QTYPE(2) + QCLASS(2)
+    q_end = idx + 5
     if q_end > n:
         return None
     hdr = pkt[0:2] + b"\x81\x80" + pkt[4:6] + b"\x00\x01\x00\x00\x00\x00"
@@ -295,7 +561,25 @@ def _send_http(conn, status, body, ctype="text/html; charset=utf-8", extra_hdr="
         conn.sendall(data)
 
 
-def _draw_screen(D, pens, ip, aps, saved_ssid, note, is_ok=False):
+def _draw_qr(D, qr_data, bx, by, bsize, c_light, c_dark):
+    D.set_pen(c_light)
+    D.rectangle(bx, by, bsize, bsize)
+    if qr_data is None:
+        return
+    n, mat = qr_data
+    sc = max(1, (bsize - 16) // n)
+    ox = bx + (bsize - n * sc) // 2
+    oy = by + (bsize - n * sc) // 2
+    D.set_pen(c_dark)
+    for r in range(n):
+        row = mat[r]
+        y = oy + r * sc
+        for c in range(n):
+            if row[c]:
+                D.rectangle(ox + c * sc, y, sc, sc)
+
+
+def _draw_screen(D, pens, ip, ap_pw, aps, saved_ssid, note, qr_data=None, qr_mode=0, is_ok=False):
     C_BG, C_PANEL, C_TEXT, C_MUTED, C_CYAN, C_GREEN, C_AMBER, C_RED = pens
     W, H = D.get_bounds()
     D.set_pen(C_BG)
@@ -303,47 +587,62 @@ def _draw_screen(D, pens, ip, aps, saved_ssid, note, is_ok=False):
 
     # Header
     D.set_pen(C_PANEL)
-    D.rectangle(0, 0, W, 46)
+    D.rectangle(0, 0, W, 44)
     D.set_pen(C_TEXT)
-    D.text("POWERWALL 3", 8, 6, scale=2)
+    D.text("POWERWALL 3", 8, 5, scale=2)
     D.set_pen(C_CYAN)
-    D.text("Wi-Fi Setup AP", 8, 26, scale=2)
+    D.text("Wi-Fi Setup AP", 8, 25, scale=2)
     D.set_pen(C_GREEN if is_ok else C_AMBER)
     lbl = "SAVED" if is_ok else "SETUP"
-    D.text(lbl, W - 8 - D.measure_text(lbl, 2), 14, scale=2)
+    D.text(lbl, W - 8 - D.measure_text(lbl, 2), 13, scale=2)
 
-    # Step 1 card
-    D.set_pen(C_PANEL)
-    D.rectangle(10, 54, W - 20, 44)
+    # Left column: credentials, URL, scan count, status (x=8..160)
     D.set_pen(C_CYAN)
-    D.rectangle(10, 54, 4, 44)
-    D.text("1. JOIN WI-FI ON PHONE (OPEN)", 20, 60, scale=1)
+    D.text("1. WI-FI NETWORK", 8, 52, scale=1)
     D.set_pen(C_TEXT)
-    D.text(AP_SSID, 20, 74, scale=2)
+    D.text(AP_SSID, 8, 63, scale=1)
 
-    # Step 2 card
-    D.set_pen(C_PANEL)
-    D.rectangle(10, 106, W - 20, 44)
+    D.set_pen(C_CYAN)
+    D.text("PASSKEY", 8, 78, scale=1)
     D.set_pen(C_AMBER)
-    D.rectangle(10, 106, 4, 44)
-    D.text("2. OPEN BROWSER (OR POPUP)", 20, 112, scale=1)
-    D.set_pen(C_TEXT)
-    D.text("http://" + ip, 20, 126, scale=2)
+    D.text(ap_pw, 8, 89, scale=2)
 
-    # Scan summary + live note
+    D.set_pen(C_CYAN)
+    D.text("2. OPEN BROWSER", 8, 113, scale=1)
+    D.set_pen(C_TEXT)
+    D.text("http://" + ip, 8, 124, scale=1)
+
     pw_cnt = sum(1 for s, _ in aps if s.startswith("TeslaPW_") or s.startswith("TEG-"))
     D.set_pen(C_MUTED)
-    D.text("Scanned: {} APs ({} TeslaPW)".format(len(aps), pw_cnt), 12, 160, scale=1)
+    D.text("APs: {} ({} TeslaPW)".format(len(aps), pw_cnt), 8, 144, scale=1)
     cur_lbl = saved_ssid if (saved_ssid and saved_ssid != "TeslaPW_XXXXXX") else "(none)"
-    D.text("Current: " + cur_lbl[:28], 12, 174, scale=1)
+    D.text("Cur: " + cur_lbl[:20], 8, 158, scale=1)
+
     D.set_pen(C_GREEN if is_ok else C_AMBER)
-    D.text(note[:38], 12, 194, scale=1)
+    D.text(note[:25], 8, 178, scale=1)
+    if len(note) > 25:
+        D.text(note[25:50], 8, 190, scale=1)
+
+    # Right column: dynamic QR code box (148x148 at x=166..313, y=50..197)
+    bx, by, bsize = 166, 50, 148
+    if qr_data is not None:
+        _draw_qr(D, qr_data, bx, by, bsize, C_TEXT, C_BG)
+        cap = "SCAN: JOIN WI-FI" if qr_mode == 0 else "SCAN: OPEN PAGE"
+        D.set_pen(C_CYAN if qr_mode == 0 else C_AMBER)
+        D.text(cap, bx + (bsize - D.measure_text(cap, 1)) // 2, by + bsize + 5, scale=1)
+    else:
+        D.set_pen(C_PANEL)
+        D.rectangle(bx, by, bsize, bsize)
+        D.set_pen(C_MUTED)
+        msg = "Scanning..."
+        D.text(msg, bx + (bsize - D.measure_text(msg, 1)) // 2, by + bsize // 2 - 4, scale=1)
 
     # Footer
     D.set_pen(C_PANEL)
     D.rectangle(0, H - 20, W, 20)
     D.set_pen(C_MUTED)
-    D.text("A:Rescan   B/Y:Cancel & Reboot", 12, H - 15, scale=1)
+    x_lbl = "X:URL QR" if qr_mode == 0 else "X:WiFi QR"
+    D.text("A:Scan  {}  B/Y:Exit".format(x_lbl), 8, H - 15, scale=1)
     D.update()
 
 
@@ -376,10 +675,11 @@ def _close_quiet(obj):
 
 
 def run_portal(D, btns, cfg, pens, wdt=None):
-    """Run SoftAP captive portal until user saves, cancels (B/Y), or times out; then reboot."""
+    """Run SoftAP captive portal with dynamic WPA2 QR until saved, cancelled, or timed out."""
     t_ms, t_diff = time.ticks_ms, time.ticks_diff
     D.set_backlight(getattr(cfg, "BACKLIGHT_ACTIVE", 0.75))
     cur = _current_defaults(cfg)
+    ap_pw = _gen_ap_pass()
 
     def _wait_release():
         t0 = t_ms()
@@ -388,14 +688,24 @@ def run_portal(D, btns, cfg, pens, wdt=None):
                 wdt()
             time.sleep_ms(30)
 
-    _draw_screen(D, pens, "192.168.4.1", [], cur["ssid"], "Scanning Wi-Fi networks...")
+    _draw_screen(D, pens, "192.168.4.1", ap_pw, [], cur["ssid"], "Scanning Wi-Fi...")
     _wait_release()
     aps = _scan_aps(wdt)
 
-    ap, ip = _start_ap(wdt)
+    ap, ip = _start_ap(ap_pw, wdt)
     ip_bytes = bytes(int(x) for x in ip.split("."))
-    print("Setup AP up: '{}' at http://{}".format(AP_SSID, ip))
-    _draw_screen(D, pens, ip, aps, cur["ssid"], "Waiting for phone connection...")
+    print("Setup AP '{}' pass '{}' at http://{}".format(AP_SSID, ap_pw, ip))
+
+    if wdt:
+        wdt()
+    qr_wifi = encode_qr(_qr_wifi_str(AP_SSID, ap_pw))
+    if wdt:
+        wdt()
+    qr_url = encode_qr("http://" + ip)
+    gc.collect()
+    qr_mode = 0  # 0=WiFi join QR, 1=Setup URL QR
+    note = "Scan QR with phone camera"
+    _draw_screen(D, pens, ip, ap_pw, aps, cur["ssid"], note, qr_wifi, qr_mode)
 
     dns_sock = None
     http_sock = None
@@ -422,6 +732,7 @@ def run_portal(D, btns, cfg, pens, wdt=None):
         last_act = t_ms()
         saved = False
         y_rel = btns[3].value() == 1
+        x_prev = 1
         while not saved:
             if wdt:
                 wdt()
@@ -431,26 +742,35 @@ def run_portal(D, btns, cfg, pens, wdt=None):
             # Cancel on B (1) or Y (3 after release)
             if btns[1].value() == 0 or (y_rel and btns[3].value() == 0):
                 print("Setup cancelled by user.")
-                _draw_screen(D, pens, ip, aps, cur["ssid"], "Cancelled. Rebooting...")
+                _draw_screen(D, pens, ip, ap_pw, aps, cur["ssid"], "Cancelled. Rebooting...", qr_wifi if qr_mode == 0 else qr_url, qr_mode)
                 break
+            # Toggle WiFi / URL QR on X (2)
+            xv = btns[2].value()
+            if x_prev == 1 and xv == 0:
+                qr_mode ^= 1
+                last_act = now
+                _draw_screen(D, pens, ip, ap_pw, aps, cur["ssid"], note, qr_wifi if qr_mode == 0 else qr_url, qr_mode)
+            x_prev = xv
             # Rescan on A (0)
             if btns[0].value() == 0:
-                _draw_screen(D, pens, ip, aps, cur["ssid"], "Rescanning Wi-Fi...")
+                _draw_screen(D, pens, ip, ap_pw, aps, cur["ssid"], "Rescanning Wi-Fi...")
                 try:
                     ap.active(False)
                 except Exception:
                     pass
                 time.sleep_ms(150)
                 aps = _scan_aps(wdt)
-                ap, ip = _start_ap(wdt)
+                ap, ip = _start_ap(ap_pw, wdt)
                 ip_bytes = bytes(int(x) for x in ip.split("."))
+                qr_url = encode_qr("http://" + ip)
                 _wait_release()
                 last_act = t_ms()
-                _draw_screen(D, pens, ip, aps, cur["ssid"], "Rescan complete. Waiting...")
+                note = "Rescan done. Scan QR"
+                _draw_screen(D, pens, ip, ap_pw, aps, cur["ssid"], note, qr_wifi if qr_mode == 0 else qr_url, qr_mode)
                 continue
             if t_diff(now, last_act) >= TIMEOUT_MS:
                 print("Setup timed out; rebooting.")
-                _draw_screen(D, pens, ip, aps, cur["ssid"], "Timed out. Rebooting...")
+                _draw_screen(D, pens, ip, ap_pw, aps, cur["ssid"], "Timed out. Rebooting...", qr_wifi if qr_mode == 0 else qr_url, qr_mode)
                 break
 
             events = poller.poll(100)
@@ -472,7 +792,8 @@ def run_portal(D, btns, cfg, pens, wdt=None):
                         if not method:
                             continue
                         if method == "GET" and path == "/":
-                            _draw_screen(D, pens, ip, aps, cur["ssid"], "Browser connected (" + str(addr[0]) + ")")
+                            note = "Connected: " + str(addr[0])
+                            _draw_screen(D, pens, ip, ap_pw, aps, cur["ssid"], note, qr_wifi if qr_mode == 0 else qr_url, qr_mode)
                             gc.collect()
                             _send_http(conn, "200 OK", _render_form(aps, cur))
                         elif method == "POST" and path == "/save":
@@ -503,11 +824,10 @@ def run_portal(D, btns, cfg, pens, wdt=None):
                                 }
                                 save_settings(new_cfg)
                                 _send_http(conn, "200 OK", _render_saved(ssid))
-                                _draw_screen(D, pens, ip, aps, ssid, "Saved! Rebooting...", is_ok=True)
+                                _draw_screen(D, pens, ip, ap_pw, aps, ssid, "Saved! Rebooting...", qr_wifi if qr_mode == 0 else qr_url, qr_mode, is_ok=True)
                                 print("Saved wifi.json for SSID:", ssid)
                                 saved = True
                         else:
-                            # Captive portal redirect for OS probe URLs
                             _send_http(conn, "302 Found", "", extra_hdr="Location: http://{}/\r\n".format(ip))
                     except Exception as e:
                         print("HTTP error:", e)
