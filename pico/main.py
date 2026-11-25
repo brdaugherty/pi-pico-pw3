@@ -3,7 +3,7 @@
 #   A (GP12): SoC + Batt In/Out 24h <-> Battery & Thermal (OOB warning light)
 #   B (GP13): Grid In/Out 24h       <-> Grid & AC Vitals (ieee20305 export limit)
 #   X (GP14): Live Power Flow       <-> Solar Strings A-F  [default]
-#   Y (GP15): Backlight cycle (Auto-Dim -> Bright -> Off)
+#   Y (GP15): Backlight cycle (short) / Wi-Fi Setup AP (hold 1.5s)
 
 print("PW3: start")
 import gc
@@ -19,6 +19,7 @@ gc.collect()
 print("PW3: display ok")
 
 import array
+import json
 import time
 import network
 from machine import Pin, WDT
@@ -26,6 +27,29 @@ from pimoroni import RGBLED
 
 import tedapi_query as tq
 from powerwall_api import Powerwall3Client, RateLimitError, AuthError
+
+
+def load_saved_wifi():
+    try:
+        with open("wifi.json", "r") as f:
+            s = json.load(f)
+        if not isinstance(s, dict):
+            return False
+        if s.get("ssid"):
+            cfg.WIFI_SSID = s["ssid"]
+        if s.get("pass"):
+            cfg.WIFI_PASS = s["pass"]
+            cfg.GW_PASSWORD = s["pass"]
+        for jk, ck in (("pw_host", "PW_HOST"), ("pw_port", "PW_PORT"), ("poll_s", "POLL_INTERVAL_S"),
+                       ("exp_lim_w", "EXPORT_LIMIT_W"), ("soc_app", "SOC_SCALE_TO_APP"), ("wdt", "ENABLE_WDT")):
+            if jk in s:
+                setattr(cfg, ck, s[jk])
+        return bool(s.get("ssid"))
+    except Exception:
+        return False
+
+
+load_saved_wifi()
 
 t_ms, t_add, t_diff = time.ticks_ms, time.ticks_add, time.ticks_diff
 C_BG = D.create_pen(10, 14, 22)
@@ -47,15 +71,18 @@ led.set_rgb(0, 0, 0)
 btns = tuple(Pin(p, Pin.IN, Pin.PULL_UP) for p in (12, 13, 14, 15))
 _btn_q = 0
 _btn_db = [t_add(t_ms(), -500)] * 4
+_y_t0 = None
 
 
 def _mk_irq(i):
     def _h(_p):
-        global _btn_q
+        global _btn_q, _y_t0
         now = t_ms()
         if t_diff(now, _btn_db[i]) >= 180:
             _btn_db[i] = now
             _btn_q |= 1 << i
+            if i == 3:
+                _y_t0 = now
     return _h
 
 
@@ -627,6 +654,17 @@ def main():
     else:
         wdt = None
 
+    def _enter_setup():
+        for b in btns:
+            b.irq(handler=None)
+        gc.collect()
+        import wifi_setup
+        wifi_setup.run_portal(D, btns, cfg, (C_BG, C_PANEL, C_TEXT, C_MUTED, C_CYAN, C_GREEN, C_AMBER, C_RED), wdt)
+
+    if cfg.WIFI_SSID in ("", "TeslaPW_XXXXXX"):
+        print("WiFi not configured; starting setup portal...")
+        _enter_setup()
+
     try:
         print("Init WiFi...")
         wlan = init_wifi(wdt)
@@ -652,10 +690,20 @@ def main():
     cfresh = min(15, cfg.POLL_INTERVAL_S) * 1000
 
     def _poll_btn(now):
-        global view_mode, bl_mode, last_input_ms, comp_pending, comp_due, _btn_q
-        q = _btn_q
+        global view_mode, bl_mode, last_input_ms, comp_pending, comp_due, _btn_q, _y_t0
+        if btns[3].value() == 0:
+            if _y_t0 is None:
+                _y_t0 = now
+            elif t_diff(now, _y_t0) >= 1500:
+                _btn_q &= ~8
+                _y_t0 = None
+                _enter_setup()
+                return True
+        else:
+            _y_t0 = None
+        q = _btn_q & (7 if btns[3].value() == 0 else 15)
         if q:
-            _btn_q = 0
+            _btn_q &= ~q
             for i in range(4):
                 if q & (1 << i):
                     last_input_ms = now
